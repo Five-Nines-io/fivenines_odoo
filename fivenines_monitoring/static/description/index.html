@@ -1,0 +1,24 @@
+<section class="oe_container">
+  <div class="oe_row oe_spaced">
+    <h2 class="oe_slogan">Fivenines Monitoring</h2>
+    <h3 class="oe_slogan">The Odoo.sh "Monitor" tab, for every Odoo you run</h3>
+    <p class="oe_mt32">
+      Install the module, paste your Fivenines enrollment key, done. Every minute, each Odoo
+      instance pushes its own metrics to <a href="https://fivenines.io">Fivenines</a> over HTTPS.
+      Nothing to open on the firewall, no agent to run. Odoo 16, 17, 18 and 19, Community and
+      Enterprise, Odoo.sh and self-hosted.
+    </p>
+    <ul>
+      <li><b>Requests</b>: requests per minute by status, p50 / p95 / p99 latency, SQL per request.</li>
+      <li><b>Errors</b>: ERROR and CRITICAL counts grouped by fingerprint, without customer data.</li>
+      <li><b>Scheduled actions</b>: late, stuck, running and failing crons.</li>
+      <li><b>Database</b>: size, connections, longest transaction.</li>
+      <li><b>System</b>: CPU, memory, disk, with real container limits (cgroup v1/v2).</li>
+      <li><b>Restarts</b>: redeploys show as events, not as gaps.</li>
+    </ul>
+    <p>
+      Each instance gets its own secret, revocable on its own. Copied databases (staging from
+      production) enroll as new instances automatically. Secrets are never logged.
+    </p>
+  </div>
+</section>

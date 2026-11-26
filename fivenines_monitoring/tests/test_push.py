@@ -17,7 +17,6 @@ from odoo import fields
 from odoo.exceptions import AccessError
 from odoo.tests.common import HttpCase, TransactionCase, tagged
 
-from ..lib import collector as fn_collector
 from ..lib import spool, stats
 from ..lib.collector import COLLECTOR
 from ..models import fivenines_monitor as fm
@@ -367,6 +366,35 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(self.run_push()['result'], 'revoked')
         self.icp.set_param('database.uuid', 'copy-of-revoked')
         self.assertEqual(self.run_push()['result'], 'pushed')
+
+    def test_neutralization_drops_the_secret(self):
+        from odoo.modules import neutralize
+        self.run_push()
+        self.assertTrue(self.icp.get_param(fm.P_SECRET))
+        neutralize.neutralize_database(self.env.cr)
+
+        def raw(key):  # SQL: get_param is ormcached (Odoo 19 'stable' cache group)
+            self.env.cr.execute('SELECT value FROM ir_config_parameter WHERE key = %s', [key])
+            row = self.env.cr.fetchone()
+            return row and row[0]
+
+        self.assertFalse(raw(fm.P_SECRET))
+        self.assertFalse(raw(fm.P_INSTANCE))
+        self.assertEqual(raw(fm.P_KEY), self.key)
+        cron = self.env.ref('fivenines_monitoring.ir_cron_fivenines_push')
+        self.env.cr.execute('SELECT active FROM ir_cron WHERE id = %s', [cron.id])
+        self.assertFalse(self.env.cr.fetchone()[0], 'Odoo neutralization deactivates every cron, ours included')
+        if hasattr(self.env.registry, 'clear_cache'):
+            for group in ('default', 'stable'):
+                try:
+                    self.env.registry.clear_cache(group)
+                except (KeyError, TypeError):
+                    pass
+        else:
+            self.env.registry.clear_caches()
+        # re-activated by an administrator, the copy enrolls as a new instance
+        self.assertEqual(self.run_push()['result'], 'pushed')
+        self.assertEqual(len(self.stub_requests('enroll')), 2)
 
     def test_normalize_url(self):
         self.assertEqual(fm.normalize_url('HTTPS://Erp.Example.com:443/'), 'https://erp.example.com')
