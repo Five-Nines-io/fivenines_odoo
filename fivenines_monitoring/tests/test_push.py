@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import shutil
+import subprocess
 import tempfile
 import time
 from datetime import timedelta
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 import requests
 
-from odoo import fields
+from odoo import fields, release
 from odoo.exceptions import AccessError
 from odoo.tests.common import HttpCase, TransactionCase, tagged
 
@@ -407,21 +408,27 @@ class TestEvents(FiveninesCase, TransactionCase):
 
     def test_restart_event(self):
         self.run_push()
-        self.icp.set_param(fm.P_SERVER, json.dumps({'pid': 1, 'started_at': 1000.0, 'mode': 'prefork'}))
+        # a previous identity that cannot be ours (Odoo is pid 1 in Docker)
+        fake = {'pid': 4194301, 'started_at': 1000.0, 'mode': 'prefork'}
+        self.icp.set_param(fm.P_SERVER, json.dumps(fake))
         self.run_push()
         events = self.last_payload()['events']
         self.assertEqual([e['type'] for e in events], ['server_restart'])
-        self.assertEqual(events[0]['previous']['pid'], 1)
+        self.assertEqual(events[0]['previous']['pid'], fake['pid'])
         stored = json.loads(self.icp.get_param(fm.P_SERVER))
-        self.assertNotEqual(stored['pid'], 1)
+        self.assertNotEqual(stored, fake)
         self.run_push()
         self.assertEqual(self.last_payload()['events'], [])
 
     def test_workers_changed_event(self):
         import psutil
         self.run_push()
-        # any live process that is not this one (whose own file the collector writes)
-        parent = psutil.Process(os.getppid())
+        # a live process that is not this one (whose own file the collector
+        # writes); not the parent: Odoo is pid 1 in Docker
+        child = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        parent = psutil.Process(child.pid)
         before = len(self.last_payload()['process']['workers'])
         self.fake_process_file(parent.pid, parent.create_time(), requests_2xx=1)
         self.run_push()
@@ -535,3 +542,61 @@ class TestHttpCapture(FiveninesCase, HttpCase):
         self.assertGreater(http['sql_queries_total'], 0)
         self.assertIsNotNone(http['latency_ms']['p50'])
         self.assertEqual(http['timed_requests'], http['requests_total'])
+
+
+@tagged('post_install', '-at_install', 'fivenines')
+class TestSettingsUi(FiveninesCase, HttpCase):
+    """The standalone settings form renders in the web client of 16-19 and
+    "Send now" pushes. Skipped where Chrome is not installed."""
+
+    def test_settings_form_send_now(self):
+        action = self.env.ref('fivenines_monitoring.action_fivenines_settings')
+        code = """
+            const start = Date.now();
+            (function check() {
+                const key = document.querySelector('[name="fivenines_enrollment_key"]');
+                const state = document.querySelector('[name="fivenines_state"]');
+                const button = document.querySelector('button[name="action_fivenines_push_now"]');
+                if (key && state && button) {
+                    button.click();
+                    (function notified() {
+                        const n = document.querySelector('.o_notification');
+                        if (n && n.textContent.includes('Metrics sent to Fivenines')) {
+                            console.log('test successful');
+                        } else if (Date.now() - start > 40000) {
+                            console.error('no success notification: ' + (n ? n.textContent : 'none'));
+                        } else {
+                            setTimeout(notified, 200);
+                        }
+                    })();
+                } else if (Date.now() - start > 30000) {
+                    console.error('Fivenines settings form not rendered');
+                } else {
+                    setTimeout(check, 250);
+                }
+            })();
+        """
+        Settings = self.registry['res.config.settings']
+        notify = Settings._fivenines_notify
+
+        def no_reload(self_, outcome):
+            # the real action reloads the page after the notification, which
+            # would end this script before it sees the notification
+            action = notify(self_, outcome)
+            action['params'].pop('next', None)
+            return action
+
+        with patch.object(Settings, '_fivenines_notify', no_reload):
+            try:
+                self.browser_js('/web#action=%d' % action.id, code, login='admin', timeout=60)
+            except Exception as e:  # noqa: BLE001
+                # Odoo 16's test browser teardown calls Storage.clearDataForOrigin
+                # with a scheme-less origin, which current Chrome rejects. The
+                # push assertion below still checks the click did its job.
+                if not (release.version_info[0] == 16 and 'is not a valid URL' in str(e)):
+                    raise
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.stub.state.pushes:
+            time.sleep(0.25)
+        self.assertTrue(self.stub.state.pushes, 'the Send now button did not push')
+        self.assertEqual(self.stub.state.pushes[-1]['payload']['instance']['database'], self.env.cr.dbname)

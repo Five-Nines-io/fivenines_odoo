@@ -64,19 +64,32 @@ def perf_from_thread(thread):
     return query_count, query_time, max(0.0, time.time() - perf_t0 - query_time)
 
 
+# Werkzeug < 2.0 (e.g. 1.0.1 from Debian bullseye, used by the official odoo:16
+# image) formats the line BEFORE logging: record.args is empty and the status
+# sits at the end of the message: ... "GET /web HTTP/1.1" 200 1234
+_PREFORMATTED_TAIL = re.compile(r'" (\d{3}|-) (?:\d+|-)\s*$')
+
+
+def _preformatted_status(record):
+    if record.args or not isinstance(record.msg, str):
+        return None
+    match = _PREFORMATTED_TAIL.search(strip_ansi(record.msg))
+    return match.group(1) if match else None
+
+
 def is_request_record(record):
-    return (
-        record.name == 'werkzeug'
-        and record.levelno == logging.INFO
-        and isinstance(record.msg, str)
-        and _WERKZEUG_REQUEST_MSG in record.msg
-        and isinstance(record.args, tuple)
-        and len(record.args) >= 3
-    )
+    if record.name != 'werkzeug' or record.levelno != logging.INFO or not isinstance(record.msg, str):
+        return False
+    if isinstance(record.args, tuple) and len(record.args) >= 3 and _WERKZEUG_REQUEST_MSG in record.msg:
+        return True  # werkzeug 2.x / 3.x: '"%s" %s %s' with (request line, code, size)
+    return _preformatted_status(record) is not None
 
 
 def request_status(record):
-    raw = strip_ansi(record.args[1]).strip()
+    if record.args:
+        raw = strip_ansi(record.args[1]).strip()
+    else:
+        raw = _preformatted_status(record) or ''
     try:
         return int(raw)
     except ValueError:

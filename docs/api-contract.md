@@ -216,7 +216,9 @@ Computed against the last acknowledged push, so an event is resent until the ser
 
 ### `http`
 
-Built from the `werkzeug` access log record: status = `record.args[1]`, time and SQL from
+Built from the `werkzeug` access log record: status = `record.args[1]` (Werkzeug 2+; Werkzeug
+1.x, e.g. Debian bullseye's in the official `odoo:16` image, logs the line pre-formatted and the
+status is parsed from its end), time and SQL from
 `record.perf_info` = `query_count query_time remaining_time` (Odoo 12+). Total time =
 `query_time + remaining_time`. Only requests served for THIS database are counted.
 

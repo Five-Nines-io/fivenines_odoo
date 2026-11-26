@@ -127,6 +127,19 @@ class TestCollector(BaseCase):
         self.assertAlmostEqual(snap['http']['latency_sum_ms'], 200.0, places=3)
         self.assertIsNone(self.collector.snapshot('db_b'))
 
+    def test_preformatted_werkzeug_1_line(self):
+        # werkzeug 1.0 formats the line itself: no record.args
+        msg = '127.0.0.1 - - [26/Nov/2026 22:47:49] "GET /web/login HTTP/1.1" 503 -\n'
+        record = logging.LogRecord('werkzeug', logging.INFO, __file__, 1, msg, None, None)
+        record.perf_info = '4 0.001 0.002'
+        self.assertTrue(fn_collector.is_request_record(record))
+        _Thread.run('db_a', lambda: self.handler.emit(record))
+        startup = logging.LogRecord('werkzeug', logging.INFO, __file__, 1, ' * Running on http://x/', None, None)
+        self.assertFalse(fn_collector.is_request_record(startup))
+        snap = self.collector.snapshot('db_a')
+        self.assertEqual(snap['http']['status']['5xx'], 1)
+        self.assertEqual(snap['http']['sql_queries'], 4)
+
     def test_request_without_perf_info(self):
         _Thread.run('db_a', lambda: self.handler.emit(_request_record(200, perf_info='- - -')))
         snap = self.collector.snapshot('db_a')
