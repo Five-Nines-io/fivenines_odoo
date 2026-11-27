@@ -311,7 +311,9 @@ class Run:
         assert pushes[0]['instance_id'] == copy_id
         # Odoo's own duplicate (database manager / odoo-bin db duplicate),
         # run from a shell on the OTHER database (no connection to the source)
-        code = 'import odoo.service.db as d\nd.exp_duplicate_database(%r, %r)\n' % (self.db_a, self.db_dup)
+        code = ('try:\n    import odoo.service.db as d\n    d.exp_duplicate_database(%r, %r)\n'
+                'except ImportError:  # Odoo 20.0\n    from odoo.modules import db as d\n'
+                '    d.duplicate(%r, %r)\n') % (self.db_a, self.db_dup, self.db_a, self.db_dup)
         subprocess.run([self.args.python, self.args.odoo_bin, 'shell', '-d', self.db_b, '--no-http',
                             '--addons-path=%s,%s' % (self.args.addons_path, REPO),
                             '--db_host=%s' % self.args.db_host, '--db_user=%s' % self.args.db_user,
