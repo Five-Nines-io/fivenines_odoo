@@ -24,8 +24,14 @@ Design and open questions: issue #1. The wire format is in [docs/api-contract.md
 
 ### Self-hosted (Debian/Ubuntu package, Docker, source)
 
-1. Put the `fivenines_monitoring` directory in an addons directory and add that directory to
-   `addons_path` in the Odoo config file (e.g. `/etc/odoo/odoo.conf`).
+One zip serves every Odoo version, 16 to 20:
+[fivenines_monitoring.zip](https://github.com/Five-Nines-io/fivenines_odoo/releases/latest/download/fivenines_monitoring.zip)
+(the latest release; each release also carries `fivenines_monitoring-<version>.zip` and `SHA256SUMS`).
+
+1. Unpack the zip into an addons directory (it holds one `fivenines_monitoring/` directory) and
+   add that directory to `addons_path` in the Odoo config file (e.g. `/etc/odoo/odoo.conf`).
+   For example: `sudo mkdir -p /opt/odoo-addons && sudo python3 -m zipfile -e
+   fivenines_monitoring.zip /opt/odoo-addons`, then `addons_path = ...,/opt/odoo-addons`.
 2. Restart Odoo, then Apps > Update Apps List > search "Fivenines Monitoring" > Activate.
 3. Settings > Fivenines Monitoring: paste the enrollment key, Save. The first run (within a
    minute) enrolls the instance. "Send now" pushes immediately. The key is used once: after the
@@ -35,9 +41,24 @@ Design and open questions: issue #1. The wire format is in [docs/api-contract.md
 
 ### Odoo.sh
 
-Add this repository as a Git submodule of your Odoo.sh repository, push, then install the module
-and paste the key, in each branch (production, staging, development) you want to monitor. See
-"Odoo.sh notes" below.
+Add this repository as a Git submodule of your Odoo.sh repository, pinned to a release tag (the
+same tree works on every Odoo version, so the tag does not depend on your branch's version):
+
+```sh
+git submodule add https://github.com/Five-Nines-io/fivenines_odoo.git fivenines_odoo
+git -C fivenines_odoo checkout v1.0        # the latest release tag
+git add .gitmodules fivenines_odoo && git commit -m "Add Fivenines Monitoring" && git push
+```
+
+Odoo.sh adds the submodule to the addons path. Install the module and paste the key in each
+branch (production, staging, development) you want to monitor. To upgrade, check out the newer
+tag in the submodule, commit and push; Odoo.sh updates the module. See "Odoo.sh notes" below.
+
+### Upgrading
+
+Replace the `fivenines_monitoring` directory with the one from the newer zip (or move the
+submodule to the newer tag), then upgrade the module: Apps > Fivenines Monitoring > Upgrade, or
+`odoo-bin -u fivenines_monitoring -d <database> --stop-after-init`.
 
 ## Configuration
 
@@ -132,8 +153,27 @@ python3 tools/e2e_local.py --odoo-bin <odoo>/odoo-bin --python <venv>/bin/python
 ```
 
 CI (`.github/workflows/ci.yml`) runs the tests on Odoo 16, 17, 18, 19 and 20 with the official Docker
-images and PostgreSQL 16. A manual `publish` job builds the `16.0`-`20.0` branches for the Odoo
-Apps Store (dry run by default).
+images and PostgreSQL 16, and checks on each that the release zip installs and upgrades
+(`tools/build_zip.sh`, `tools/check_release_zip.sh`). A manual `publish` job builds the
+`16.0`-`20.0` branches for the Odoo Apps Store only (it indexes one branch per Odoo version; dry
+run by default).
+
+### Releasing
+
+The manifest `version` is serie-free and in two parts, `x.y` (see the comment in
+`__manifest__.py`): Odoo adds its own serie at load time (`17.0.1.0`), a serie-prefixed version
+would be refused by the other series, and Odoo 16 never runs the migrations of a three-part
+`x.y.z`. A release bumps `y` (migrations, if any, go in `fivenines_monitoring/migrations/x.y/`):
+
+1. Set `'version': 'x.y'` in `fivenines_monitoring/__manifest__.py`, merge to `main`.
+2. Tag and push: `git tag vx.y && git push origin vx.y`. The `Release` workflow
+   (`.github/workflows/release.yml`) builds the zip, checks it on 16.0 to 20.0, and publishes the
+   GitHub release marked latest, so the link above serves it at once.
+3. Optionally, run the `publish` job for the Odoo Apps Store.
+
+To check a zip locally: `tools/build_zip.sh HEAD dist`, then
+`tools/check_release_zip.sh dist/fivenines_monitoring.zip <new database> <python> <odoo-bin>
+--db_host=localhost --db_user=$USER --addons-path-prefix=<odoo>/addons`.
 
 ## License
 

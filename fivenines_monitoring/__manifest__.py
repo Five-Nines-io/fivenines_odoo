@@ -16,9 +16,13 @@ Install it, paste your Fivenines enrollment key in Settings > Fivenines
 Monitoring (or put it in the Odoo config file / an environment variable), done.
 Nothing to open on the firewall: the instance pushes, Fivenines never pulls.
 """,
-    # The series prefix (16.0., 17.0. ...) is added by Odoo at load time, and by
-    # the publish workflow on the 16.0-20.0 branches.
-    'version': '1.0.0',
+    # ONE tree (and one release zip) for every serie: keep the version serie-free
+    # and in TWO parts, x.y. Odoo prefixes its serie at load time (16.0.1.0 ...);
+    # a serie-prefixed version is refused by the other series, and Odoo 16 never
+    # runs a migration of a three-part x.y.z version (it takes x.y.z for a full
+    # serie version). Each release bumps y; migrations go in migrations/x.y/.
+    # The publish workflow prefixes the serie on the Apps Store branches.
+    'version': '1.0',
     'category': 'Administration',
     'author': 'Fivenines',
     'website': 'https://fivenines.io',

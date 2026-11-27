@@ -631,6 +631,19 @@ class TestClient(BaseCase):
             headers = {'Retry-After': 'inf'}
         self.assertIsNone(fn_client._retry_after(_Resp()))
 
+    def test_manifest_version_fits_every_serie(self):
+        # Value: protects=one tree and one release zip install and upgrade on 16 to 20: the manifest version is serie-free and two-part (x.y), so this serie accepts it and its migration folders run here too; fails_when=someone sets 16.0.x.y.z (refused by the other series) or x.y.z (Odoo 16 then never runs a migration); why_new=#8; seam=none; no_claim=the Apps Store
+        import ast
+        import re
+        from odoo import release
+        from odoo.modules.module import adapt_version
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '__manifest__.py')
+        with open(path) as f:
+            version = ast.literal_eval(f.read())['version']
+        self.assertRegex(version, r'^[0-9]+\.[0-9]+$')
+        self.assertEqual(adapt_version(version), '%s.%s' % (release.major_version, version))
+        self.assertTrue(re.match(r'^[0-9]+\.[0-9]+$', version))
+
     def test_canonical_examples_match_the_schemas(self):
         # Value: protects=the example bodies the server vendors byte-identical stay valid against the schemas and keep one canonical formatting; fails_when=a schema or an example drifts; why_new=lead request (canonical fixtures); seam=none; no_claim=the server's own validation
         from .stub_server import load_schema, validate

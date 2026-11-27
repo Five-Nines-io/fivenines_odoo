@@ -71,7 +71,7 @@ When this document and a schema disagree, the schema wins. Fix both in the same 
 | `Content-Type` | `application/json` |
 | `Content-Encoding` | `gzip`. The module always compresses. The server must inflate (the agent API already does this in its middleware) and apply its body cap AFTER inflation. 2 MB is plenty: a real push is 3-30 KB of JSON before compression. |
 | `Accept` | `application/json` |
-| `User-Agent` | `fivenines-odoo/<module version> (Odoo <release.version>; Python <x.y.z>)`, e.g. `fivenines-odoo/19.0.1.0.0 (Odoo 19.0; Python 3.12.3)` |
+| `User-Agent` | `fivenines-odoo/<module version> (Odoo <release.version>; Python <x.y.z>)`, e.g. `fivenines-odoo/19.0.1.0 (Odoo 19.0; Python 3.12.3)` |
 
 ### Response format
 
@@ -117,7 +117,7 @@ Sent:
     "odoo_serie": "19.0",
     "odoo_version_info": [19, 0, 0, "final", 0, ""],
     "edition": "community",
-    "module_version": "19.0.1.0.0",
+    "module_version": "19.0.1.0",
     "python_version": "3.12.3",
     "hostname": "odoo-vm",
     "workers": 0,
@@ -143,7 +143,7 @@ Sent:
 | `instance.urls` | Every URL the database knows, for matching existing uptime monitors: `web.base.url` first, then each `website.domain` (`https://` added when it has no scheme), normalized like `base_url`, without duplicates, at most 50. NOT part of the fingerprint: adding a website is not a copy. |
 | `instance.odoo_version` / `odoo_serie` / `odoo_version_info` | `odoo.release.version`, `.serie`, `.version_info`. Enterprise builds look like `17.0+e`. |
 | `instance.edition` | `enterprise` when `web_enterprise` is installed, else `community`. |
-| `instance.module_version` | Manifest version of the module, e.g. `19.0.1.0.0`. |
+| `instance.module_version` | Manifest version of the module, e.g. `19.0.1.0`. |
 | `instance.workers`, `max_cron_threads` | From the Odoo config. `workers = 0` means threaded mode. |
 
 The `base_url` is the public URL: the server may offer to create an uptime monitor on it at
