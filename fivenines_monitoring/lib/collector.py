@@ -206,17 +206,25 @@ def _masked_bounded(text, limit, keep='head'):
         window = text
     elif keep == 'tail':
         window = text[-(limit + MASK_MARGIN):]
-        # open edge on a whole line, else on a whitespace: no token split there
-        edge = window.find('\n')
+        # open edge on a whole line when one starts within the margin, else on
+        # a whitespace: no token is split there, and the kept tail is intact
+        edge = window.find('\n', 0, MASK_MARGIN)
         if edge < 0:
-            edge = min([i for i in (window.find(' '), window.find('\t')) if i >= 0] or [-1])
+            edge = min([i for i in (window.find(' '), window.find('\t'), window.find('\n')) if i >= 0]
+                       or [-1])
         window = window[edge + 1:]
     else:
         window = text[:limit + MASK_MARGIN]
         edge = max(window.rfind(' '), window.rfind('\n'), window.rfind('\t'))
         if edge > 0:
             window = window[:edge]
-    return _bounded(mask_credentials(window), limit, keep)
+    out = _bounded(mask_credentials(window), limit, keep)
+    if len(text) > limit:  # cut, even when masking shrank the window below the bound
+        if keep == 'tail' and not out.startswith('[cut] '):
+            out = '[cut] ' + out
+        elif keep != 'tail' and not out.endswith('[cut]'):
+            out += ' [cut]'
+    return out
 
 
 def error_sample(record):

@@ -202,7 +202,8 @@ Server notes:
   `previous_instance_id` = the secret's instance, state `pending`, and answer 202. The original
   instance and its token are untouched. If the same copy (copy of the same instance, same
   database name, uuid, stage and neutralized flag; `base_url` aside, an admin login rewrites it)
-  already exists, answer that one: an ignored copy stays ignored (410), a pending one
+  already exists, answer that one (after a `conflict`, whose copy differs from the original by
+  its place only, the same copy is the one with the same full fingerprint): an ignored copy stays ignored (410), a pending one
   gets its token back.
 - With the enrollment key, whether a new database starts `monitored` (201) or `pending` (202) is
   the organization's policy.

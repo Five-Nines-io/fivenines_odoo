@@ -1,6 +1,7 @@
 # Part of Fivenines Monitoring. License LGPL-3.
 """Enrollment, push and error handling against the stub server."""
 
+import hashlib
 import json
 import logging
 import os
@@ -478,6 +479,9 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.fail_next(503, count=10, path='enroll')
         self.assertEqual(self.run_push()['result'], 'enroll_failed', "no wait for the original's backoff")
         announced = len(self.stub_requests('enroll'))
+        fm.icp_set(self.icp, 'web.base.url', 'https://copy.example.com')  # admin login: same copy
+        self.assertEqual(self.run_push()['result'], 'backoff')
+        self.assertEqual(len(self.stub_requests('enroll')), announced)
         for failures in (2, 3, 4):
             out = self.run_push()
             self.assertEqual(out['result'], 'backoff', out)
@@ -615,6 +619,41 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(fm.icp_get(self.icp, fm.P_KEY), self.key, 'kept for Re-enroll')
         self.assertEqual(self.run_push(trigger='manual', force=True, reenroll=True)['result'], 'pushed')
         self.assertIsNone(fm.icp_get(self.icp, fm.P_KEY), 'used once')
+
+    def test_copy_with_a_refused_key_stays_silent(self):
+        # Value: protects=a copy whose copied secret and key are both refused waits for another key without calling /enroll every minute; fails_when=the copy re-announces each run; why_new=review fix-check (red team); seam=none; no_claim=none
+        self.run_push()
+        requests.post(self.stub.url + '/_stub/revoke', timeout=5,
+                      json={'instance_id': fm.icp_get(self.icp, fm.P_INSTANCE)})
+        requests.post(self.stub.url + '/_stub/revoke_key', json={'key': self.key}, timeout=5)
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        fm.icp_set(self.icp, fm.P_KEY, self.key)
+        self.assertEqual(self.run_push()['result'], 'enrollment_refused')
+        n = len(self.stub.state.requests)
+        for _i in range(3):
+            self.expire_backoff()
+            self.assertEqual(self.run_push()['result'], 'enrollment_refused')
+        self.assertEqual(len(self.stub.state.requests), n, 'no request until the key changes')
+
+    def test_stub_keeps_distinct_conflict_copies_apart(self):
+        # Value: protects=two places that drew a 409 for one instance get two proposals, not one shared token (their copy components equal the original's); fails_when=the stub merges them on copy components; why_new=review fix-check (red team); seam=none; no_claim=the real server
+        self.run_push()
+        secret = fm.icp_get(self.icp, fm.P_SECRET)
+        body = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
+        ids = []
+        for url in ('https://node-a.example.com', 'https://node-b.example.com'):
+            components = dict(body['fingerprint_components'], base_url=url)
+            instance = dict(self.last_payload()['instance'], base_url=url, fingerprint_components=components,
+                            fingerprint=hashlib.sha256(json.dumps(components, sort_keys=True).encode()).hexdigest())
+            for k in ('instance_id', 'fingerprint_change'):
+                instance.pop(k, None)
+            r = fn_client.Client(self.stub.url, 'test').enroll(secret, {
+                'schema_version': 1, 'credential': 'instance_secret', 'reason': 'conflict',
+                'previous_instance_id': body['instance_id'], 'changed': [], 'key_source': None,
+                'instance': instance})
+            self.assertEqual(r.status, 202, r.data)
+            ids.append(r.data['instance_id'])
+        self.assertNotEqual(ids[0], ids[1])
 
     def test_key_is_dropped_when_the_database_does_not_need_one(self):
         # Value: protects=the organization key is never kept on a database that does not need it (pasted on a healthy enrolled database, or left by an enrollment that rolled back); fails_when=a pasted key stays in ir.config_parameter and travels with every dump; why_new=review pass 2 (security, testing); seam=enrolled_at moved (one test transaction); no_claim=a real rollback

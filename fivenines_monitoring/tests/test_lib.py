@@ -364,6 +364,21 @@ class TestCollector(BaseCase):
                 out = fn_collector._masked_bounded(text, limit, keep)
                 self.assertNotIn('abab', out, (keep, shift))
 
+    def test_long_last_line_is_kept_and_marked_cut(self):
+        # Value: protects=a traceback whose last line is very long keeps its tail and the "[cut] " marker; fails_when=the window opens after a far newline and empties or silently truncates the traceback; why_new=review fix-check (red team); seam=none; no_claim=none
+        # a long last line of words, then a short line: the tail is kept and marked
+        tb = 'Traceback\nValueError: ' + 'w ' * 8000 + '\nDuring handling: short'
+        out = fn_collector._masked_bounded(tb, fn_collector.MAX_TRACEBACK, 'tail')
+        self.assertTrue(out.startswith('[cut] '), out[:40])
+        self.assertTrue(out.endswith('During handling: short'))
+        self.assertGreater(len(out), 7000)
+        # one unbroken 13,000-char token cannot be cut safely: dropped, but marked
+        out = fn_collector._masked_bounded('Traceback\nValueError: ' + 'x' * 13000 + '\n',
+                                           fn_collector.MAX_TRACEBACK, 'tail')
+        self.assertTrue(out.startswith('[cut] '))
+        short = fn_collector._masked_bounded('a ' * 1500, fn_collector.MAX_MESSAGE, 'head')
+        self.assertTrue(short.endswith('[cut]'))
+
     def test_error_sample_is_built_at_most_every_10_seconds(self):
         # Value: protects=an error storm does not pay the masking cost (~1 ms, under the logging lock) per record: one sample per group per SAMPLE_EVERY, while every occurrence is still counted; fails_when=error_sample runs for every record again; why_new=review of revision 2 (performance, adversarial); seam=patched error_sample; no_claim=wall-clock timings
         calls = []

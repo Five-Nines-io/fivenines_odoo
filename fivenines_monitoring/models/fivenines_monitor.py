@@ -524,11 +524,16 @@ class FiveninesMonitor(models.AbstractModel):
             # the copied secret was refused and no key is configured: wait for one
             self._fn_sweep(directory, state)
             return {'result': 'no_key'}
+        if (status.get('state') == 'enrollment_refused' and not force and held_here and key
+                and status.get('key_hash') == _key_hash(key)):
+            # this key was refused (a copy's fallback too): wait for another key
+            self._fn_sweep(directory, state)
+            return {'result': 'enrollment_refused'}
 
         # after the fingerprint check: a copy must not wait for the original's
         # backoff, but it follows the backoff of its own failed announcements
         # (state['backoff_fingerprint'] = the digest that failed)
-        own_backoff = not copy_of or state.get('backoff_fingerprint') == digest
+        own_backoff = not copy_of or state.get('backoff_fingerprint') == copy_key(components)
         if not force and own_backoff and state.get('next_attempt_at', 0) > now:
             if status.get('state') in ('revoked', 'pending'):
                 self._fn_sweep(directory, state)
@@ -555,7 +560,7 @@ class FiveninesMonitor(models.AbstractModel):
                                       changed=copy_of['changed'])
             if outcome.get('result') != 'enrolled':
                 if outcome.get('result') == 'enroll_failed':
-                    state['backoff_fingerprint'] = digest  # this copy's own backoff
+                    state['backoff_fingerprint'] = copy_key(components)  # this copy's own backoff
                 return outcome
             return self._fn_after_enroll(api_client, directory, state, params, outcome,
                                          components, digest, now)
@@ -695,6 +700,7 @@ class FiveninesMonitor(models.AbstractModel):
                 return {'result': 'no_key', 'status': result.status}
             self._fn_store({P_STATUS: json.dumps({
                 'state': 'enrollment_refused', 'key_hash': _key_hash(value), 'at': int(now),
+                'copy_key': copy_key(components),
                 'message': result.message})})
             _warn('enroll401', 'Fivenines: the enrollment key was refused (HTTP 401). '
                   'Paste a valid key to retry.')

@@ -359,11 +359,15 @@ class Handler(BaseHTTPRequestHandler):
                     # never pushed as the original. Ignore is final for that
                     # copy: the same copy announcing itself again stays ignored.
                     # "the same copy": same copy components (not base_url, which an
-                    # admin login rewrites), like the module's hold (contract s3)
+                    # admin login rewrites), like the module's hold (contract s3).
+                    # A 409 copy differs from the original by its place only, so
+                    # it is the same copy only with the same full fingerprint.
+                    conflict = body.get('reason') == 'conflict'
                     mine = _copy_components(body['instance'].get('fingerprint_components'))
                     for other in st.instances.values():
-                        if (other.get('copy_of') == known['instance_id']
-                                and _copy_components(other.get('fingerprint_components')) == mine):
+                        same = (other['fingerprint'] == fingerprint if conflict else
+                                _copy_components(other.get('fingerprint_components')) == mine)
+                        if other.get('copy_of') == known['instance_id'] and same:
                             inst, created = other, False
                             break
                     else:
