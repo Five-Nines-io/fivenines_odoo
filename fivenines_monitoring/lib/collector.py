@@ -118,12 +118,20 @@ _MASKS = (
     (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
     (re.compile(r'\b[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
     (re.compile(r'([?&][^=\s&]+)=[^&\s]*'), r'\1=?'),  # query strings
-    # paired masks also match up to the end, for a value cut at MAX_MASKED
-    (re.compile(r'=\([^)]*(?:\)|$)'), '=(?)'),      # psycopg2: Key (email)=(x)
-    (re.compile(r'"[^"]*(?:"|$)'), '"?"'),
-    (re.compile(r"'[^']*(?:'|$)"), "'?'"),
+    (re.compile(r'=\([^)]*\)'), '=(?)'),            # psycopg2: Key (email)=(x)
+    (re.compile(r'"[^"]*"'), '"?"'),
+    (re.compile(r"'[^']*'"), "'?'"),
     (re.compile(r'\b[0-9a-f]{8,}\b', re.I), '<hex>'),
     (re.compile(r'\d+(?:[.,:]\d+)*'), 'N'),
+)
+# for a message cut at MAX_MASKED only: a value whose closing delimiter was cut
+# off is masked up to the end (applied after _MASKS closed the complete pairs)
+# A quote mask applies only when that quote is left unpaired (odd count once
+# _MASKS turned the complete pairs into "?" / '?').
+_CUT_MASKS = (
+    (None, re.compile(r'=\([^)]*$'), '=(?'),
+    ('"', re.compile(r'"[^"]*$'), '"?'),
+    ("'", re.compile(r"'[^']*$"), "'?"),
 )
 
 
@@ -136,10 +144,18 @@ def mask_values(text):
     """
     cut = len(text) > MAX_MASKED
     if cut:
-        text = re.sub(r'\S*$', '', text[:MAX_MASKED])
+        text = text[:MAX_MASKED]
+        # drop the token cut at the bound (linear: no regex)
+        last_space = max(text.rfind(' '), text.rfind('\n'), text.rfind('\t'))
+        text = text[:last_space + 1]
     for pattern, replacement in _MASKS:
         text = pattern.sub(replacement, text)
-    return text + ' [cut]' if cut else text
+    if not cut:
+        return text
+    for quote, pattern, replacement in _CUT_MASKS:
+        if quote is None or text.count(quote) % 2:
+            text = pattern.sub(replacement, text)
+    return text + ' [cut]'
 
 
 def log_fingerprint(record):

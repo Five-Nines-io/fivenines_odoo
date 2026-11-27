@@ -219,11 +219,15 @@ class TestCollector(BaseCase):
         self.assertLessEqual(len(info['message_template']), 300)
         # values cut at the bound never escape their mask (fix-check finding)
         mask = fn_collector.mask_values
-        self.assertEqual(mask('Bad payload "' + 'customer Jane ' * 300 + '" end'), 'Bad payload "?" [cut]')
+        self.assertEqual(mask('Bad payload "' + 'customer Jane ' * 300 + '" end'), 'Bad payload "? [cut]')
         self.assertNotIn('xxx', mask("Webhook failed: '" + 'x' * 3000 + "'"))
         cut = mask('"' + 'x' * 1983 + '" to jane.doe@corp.com and more ' + 'y' * 50)
         self.assertNotIn('jane', cut)
+        self.assertTrue(cut.startswith('"?" to'), cut)  # a closed pair stays closed
         self.assertEqual(mask('a@b.com+c@d.com'), '<email><email>')
+        # a short message keeps its text after an apostrophe (no cut: closed pairs only)
+        self.assertEqual(mask("Record doesn't exist or has been deleted. (Record: res.partner(42,), User: 7)"),
+                         "Record doesn't exist or has been deleted. (Record: res.partner(N,), User: N)")
         self.assertEqual(mask('step 1.https://h/s?k=1'), 'step N.<url>')
 
     def test_prefork_master_is_ignored(self):
