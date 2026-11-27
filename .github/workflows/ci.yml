@@ -85,6 +85,14 @@ jobs:
           # at least one test must have run ("of 0 tests" is how a bad tag passes)
           grep -E "odoo.tests.result: 0 failed, 0 error\(s\) of [1-9][0-9]* tests" odoo.log
           if grep -E " (ERROR|CRITICAL) fivenines_ci " odoo.log; then echo "errors logged"; exit 1; fi
+      - name: The release zip installs and upgrades on this serie
+        run: |
+          out=$(mktemp -d)
+          tools/build_zip.sh HEAD "$out"
+          # the extraction directory is mounted at the same path in the container
+          TMPDIR=$RUNNER_TEMP tools/check_release_zip.sh "$out/fivenines_monitoring.zip" fivenines_zip \
+            docker run --rm --network host -e HOST=127.0.0.1 -e USER=odoo -e PASSWORD=odoo \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP:ro" odoo:${{ matrix.odoo }} --
       - name: Upload the log
         if: always()
         uses: actions/upload-artifact@v4
@@ -92,9 +100,12 @@ jobs:
           name: odoo-${{ matrix.odoo }}-log
           path: odoo.log
 
-  # Publishes the module to the 16.0-20.0 branches the Odoo Apps Store reads,
-  # changing only the version in __manifest__.py. Manual only, dry run by
-  # default: nothing is pushed unless dry_run is unchecked on main.
+  # Publishes the module to the 16.0-20.0 branches the Odoo Apps Store reads
+  # (it indexes one branch per serie), changing only the version in
+  # __manifest__.py (x.y -> <serie>.x.y). Self-hosted installs use the release
+  # zip and Odoo.sh a submodule (release.yml, README): neither needs these
+  # branches. Manual only, dry run by default: nothing is pushed unless dry_run
+  # is unchecked on main.
   publish:
     if: github.event_name == 'workflow_dispatch'
     needs: [lint, test]
@@ -112,7 +123,7 @@ jobs:
         run: |
           set -e
           version=$(python3 -c "import ast; print(ast.literal_eval(open('fivenines_monitoring/__manifest__.py').read())['version'])")
-          case "$version" in *.*.*.*.*) echo "manifest version must not carry a serie: $version"; exit 1;; esac
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+$' || { echo "manifest version must be x.y (no serie): $version"; exit 1; }
           out=$(mktemp -d)
           cp -r fivenines_monitoring LICENSE README.md "$out/"
           sed -i "s/'version': '$version'/'version': '${{ matrix.serie }}.$version'/" "$out/fivenines_monitoring/__manifest__.py"
