@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "kind": "metrics",
+  "sent_at": 1764243600.028,
+  "stream_id": "5f0c2b9e7a1d4e3f8b6a0c9d2e1f4a7b",
+  "seq": 2,
+  "window": {
+    "start": 1764243540.016,
+    "end": 1764243600.028,
+    "seconds": 60.012,
+    "baseline_reset": false
+  },
+  "instance": {
+    "fingerprint": "acaa122f6652bffedb182f31e31ea85d8f8851021b75e35f690a616f960c65e5",
+    "fingerprint_components": {
+      "database": "odoo",
+      "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+      "base_url": "https://erp.example.com",
+      "odoo_stage": null,
+      "neutralized": false
+    },
+    "database": "odoo",
+    "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+    "base_url": "https://erp.example.com",
+    "odoo_stage": null,
+    "urls": [
+      "https://erp.example.com"
+    ],
+    "odoo_version": "19.0",
+    "odoo_serie": "19.0",
+    "odoo_version_info": [
+      19,
+      0,
+      0,
+      "final",
+      0,
+      ""
+    ],
+    "edition": "community",
+    "module_version": "19.0.1.0",
+    "python_version": "3.11.2",
+    "hostname": "odoo-vm",
+    "workers": 0,
+    "max_cron_threads": 2,
+    "instance_id": "odi_3f9a2c71d0e4",
+    "fingerprint_change": null
+  },
+  "process": {
+    "pid": 41234,
+    "started_at": 1764243599.271,
+    "mode": "threaded",
+    "workers": [],
+    "request_capture": "disabled"
+  },
+  "events": [],
+  "http": null,
+  "logs": {
+    "messages": "on",
+    "warning_count": 0,
+    "error_count": 1,
+    "critical_count": 0,
+    "fingerprints": [
+      {
+        "count": 1,
+        "logger": "odoo.addons.sale.models.sale_order",
+        "level": "ERROR",
+        "message_template": "Sync of order %s failed: %s",
+        "exception_type": "ValueError",
+        "exception_origin": "odoo/addons/sale/models/sale_order.py:812 _sync_remote",
+        "location": "odoo/addons/sale/models/sale_order.py:820",
+        "fingerprint": "9c1d0e7a5b3f2a61",
+        "last_seen_at": 1764243600.027,
+        "last_message": "Sync of order SO042 failed: password=***",
+        "last_traceback": "Traceback (most recent call last):\n  File \"/opt/odoo/addons/sale/models/sale_order.py\", line 812, in _sync_remote\n    raise ValueError(\"remote refused\")\nValueError: remote refused\n"
+      }
+    ],
+    "fingerprints_truncated": false
+  },
+  "crons": null,
+  "database": null,
+  "system": null,
+  "collector_errors": [
+    {
+      "collector": "crons",
+      "type": "InsufficientPrivilege",
+      "message": "permission denied for table ir_cron"
+    },
+    {
+      "collector": "database",
+      "type": "QueryCanceled",
+      "message": "canceling statement due to statement timeout"
+    },
+    {
+      "collector": "system",
+      "type": "ModuleNotFoundError",
+      "message": "No module named 'psutil'"
+    }
+  ]
+}

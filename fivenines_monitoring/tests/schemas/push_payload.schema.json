@@ -1,0 +1,1156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fivenines.io/schemas/odoo/push_payload.v1.json",
+  "title": "Fivenines Odoo push payload (POST /odoo/v1/collect)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "sent_at",
+    "stream_id",
+    "seq",
+    "window",
+    "instance",
+    "process",
+    "events",
+    "http",
+    "logs",
+    "crons",
+    "database",
+    "system",
+    "collector_errors"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "kind": {
+      "enum": [
+        "metrics"
+      ],
+      "description": "A metrics push. Absent means metrics; a paused heartbeat is kind \"heartbeat\" (heartbeat.schema.json)."
+    },
+    "sent_at": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Unix time, seconds (float)"
+    },
+    "stream_id": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "random id of this counter stream; a new one starts with every baseline reset (seq restarts at 1). Dedup by (stream_id, seq)"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1 + seq of the last ACKNOWLEDGED push; a resend after a lost answer repeats it"
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "start",
+        "end",
+        "seconds",
+        "baseline_reset"
+      ],
+      "properties": {
+        "start": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Unix time, seconds (float)"
+        },
+        "end": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Unix time, seconds (float)"
+        },
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "baseline_reset": {
+          "type": "boolean"
+        }
+      }
+    },
+    "instance": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "fingerprint_components",
+        "database",
+        "database_uuid",
+        "base_url",
+        "odoo_stage",
+        "odoo_version",
+        "odoo_serie",
+        "odoo_version_info",
+        "edition",
+        "module_version",
+        "python_version",
+        "hostname",
+        "workers",
+        "max_cron_threads",
+        "instance_id",
+        "fingerprint_change",
+        "urls"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "description": "sha256 hex of the canonical JSON (sorted keys) of fingerprint_components",
+          "maxLength": 64
+        },
+        "fingerprint_components": {
+          "type": "object",
+          "required": [
+            "database",
+            "database_uuid",
+            "base_url",
+            "odoo_stage",
+            "neutralized"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "database": {
+              "type": "string",
+              "description": "PostgreSQL database name"
+            },
+            "database_uuid": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ir.config_parameter database.uuid"
+            },
+            "base_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "web.base.url, normalized: lowercase scheme and host, default port and trailing slash dropped"
+            },
+            "odoo_stage": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ODOO_STAGE environment variable on Odoo.sh (production, staging, dev); null when self-hosted"
+            },
+            "neutralized": {
+              "type": "boolean",
+              "description": "database.is_neutralized (Odoo's neutralization, 16+): a neutralized database is a copy"
+            }
+          }
+        },
+        "database": {
+          "type": "string"
+        },
+        "database_uuid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_stage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_version": {
+          "type": "string",
+          "description": "odoo.release.version, e.g. 19.0 or 17.0+e"
+        },
+        "odoo_serie": {
+          "type": "string",
+          "description": "odoo.release.serie, e.g. 19.0"
+        },
+        "odoo_version_info": {
+          "type": "array",
+          "description": "odoo.release.version_info"
+        },
+        "edition": {
+          "type": "string",
+          "enum": [
+            "community",
+            "enterprise"
+          ]
+        },
+        "module_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "workers": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_cron_threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "fingerprint_change": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "base_url_changed",
+            null
+          ],
+          "description": "set on every push from a base_url change until one is acknowledged"
+        },
+        "urls": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "description": "every URL the database knows: base_url first, then the website domains (website.domain), normalized like base_url; may be empty. Not part of the fingerprint"
+        }
+      }
+    },
+    "process": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "pid",
+        "started_at",
+        "mode",
+        "workers",
+        "request_capture"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Odoo master process (prefork) or the server process (threaded)"
+        },
+        "started_at": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Unix time, seconds (float)"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "prefork",
+            "threaded",
+            "gevent",
+            null
+          ]
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "pid",
+              "started_at",
+              "last_flush_at"
+            ],
+            "properties": {
+              "pid": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "started_at": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Unix time, seconds (float)"
+              },
+              "last_flush_at": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Unix time, seconds (float)"
+              }
+            }
+          },
+          "description": "live processes that flushed counters for this database"
+        },
+        "request_capture": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "native",
+            "forced",
+            "disabled",
+            null
+          ]
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "at"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "server_restart",
+              "workers_changed"
+            ]
+          },
+          "at": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Unix time, seconds (float)"
+          },
+          "previous": {
+            "type": "object"
+          },
+          "current": {
+            "type": "object"
+          },
+          "started": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "exited": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "http": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "null = request capture impossible in this process (werkzeug logging disabled): unknown, not zero",
+      "required": [
+        "requests_total",
+        "requests_by_status",
+        "requests_per_minute",
+        "timed_requests",
+        "latency_ms",
+        "latency_histogram",
+        "sql_queries_total",
+        "sql_time_ms_total",
+        "sql_queries_per_request",
+        "sql_time_ms_per_request"
+      ],
+      "properties": {
+        "requests_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requests_by_status": {
+          "type": "object",
+          "required": [
+            "1xx",
+            "2xx",
+            "3xx",
+            "4xx",
+            "5xx",
+            "other"
+          ],
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "requests_per_minute": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "requests_total * 60 / window.seconds; null when the window is empty"
+        },
+        "timed_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "requests that carried perf_info; latency and SQL figures are over these"
+        },
+        "latency_ms": {
+          "type": "object",
+          "required": [
+            "p50",
+            "p95",
+            "p99",
+            "mean"
+          ],
+          "properties": {
+            "p50": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "milliseconds, null when no timed request"
+            },
+            "p95": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "milliseconds, null when no timed request"
+            },
+            "p99": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "milliseconds, null when no timed request"
+            },
+            "mean": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "milliseconds, null when no timed request"
+            }
+          }
+        },
+        "latency_histogram": {
+          "type": "object",
+          "required": [
+            "bounds_ms",
+            "counts"
+          ],
+          "properties": {
+            "bounds_ms": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "counts": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "description": "len(bounds_ms)+1 buckets; counts[i] = requests with latency <= bounds_ms[i] and > bounds_ms[i-1]; the last bucket is > the last bound"
+            }
+          }
+        },
+        "sql_queries_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sql_time_ms_total": {
+          "type": "number",
+          "minimum": 0
+        },
+        "sql_queries_per_request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sql_time_ms_per_request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "logs": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "messages",
+        "warning_count",
+        "error_count",
+        "critical_count",
+        "fingerprints",
+        "fingerprints_truncated"
+      ],
+      "properties": {
+        "messages": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "description": "on (default): each group carries its latest message and traceback; off: the database turned error messages off, groups and counts only"
+        },
+        "warning_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "critical_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fingerprints": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "required": [
+              "fingerprint",
+              "count",
+              "logger",
+              "level",
+              "message_template",
+              "exception_type",
+              "exception_origin",
+              "location",
+              "last_seen_at",
+              "last_message",
+              "last_traceback"
+            ],
+            "properties": {
+              "fingerprint": {
+                "type": "string",
+                "maxLength": 64
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "logger": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "ERROR",
+                  "CRITICAL"
+                ]
+              },
+              "message_template": {
+                "type": "string",
+                "maxLength": 300,
+                "description": "record.msg BEFORE argument substitution (values masked when the message was formatted before logging); the grouping key"
+              },
+              "exception_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "exception_origin": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "innermost traceback frame: path:line function"
+              },
+              "location": {
+                "type": "string",
+                "description": "where the log call is: path:line"
+              },
+              "last_seen_at": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Unix time of the latest occurrence"
+              },
+              "last_message": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 2100,
+                "description": "the latest occurrence's formatted message, credentials masked; null when messages are off"
+              },
+              "last_traceback": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 8100,
+                "description": "the latest occurrence's traceback (its last 8000 chars), credentials masked; null when messages are off or there is none"
+              }
+            }
+          }
+        },
+        "fingerprints_truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "crons": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "active_count",
+        "due_count",
+        "overdue_count",
+        "running_count",
+        "late_count",
+        "stuck_count",
+        "failing_count",
+        "failure_fields_available",
+        "late_threshold_seconds",
+        "stuck_threshold_seconds",
+        "jobs",
+        "jobs_truncated"
+      ],
+      "properties": {
+        "active_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "due_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "overdue_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "running_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "late_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stuck_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failing_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "null before Odoo 18 (no failure_count field)"
+        },
+        "failure_fields_available": {
+          "type": "boolean"
+        },
+        "late_threshold_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stuck_threshold_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "jobs": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "state",
+              "nextcall",
+              "lastcall",
+              "lateness_seconds",
+              "interval",
+              "priority",
+              "running",
+              "failure_count",
+              "first_failure_at"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "late",
+                  "stuck",
+                  "running",
+                  "failing"
+                ]
+              },
+              "nextcall": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Unix time, seconds (float), null = unknown"
+              },
+              "lastcall": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Unix time, seconds (float), null = unknown"
+              },
+              "lateness_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "interval": {
+                "type": "string",
+                "description": "e.g. '1 minutes', '1 days'"
+              },
+              "priority": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "running": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "failure_count": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "first_failure_at": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Unix time, seconds (float), null = unknown"
+              }
+            }
+          }
+        },
+        "jobs_truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "database": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "size_bytes",
+        "connections",
+        "longest_transaction_seconds",
+        "server_connections_total",
+        "server_max_connections",
+        "odoo_db_maxconn",
+        "postgresql_version_num"
+      ],
+      "properties": {
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "connections": {
+          "type": "object",
+          "required": [
+            "total",
+            "active",
+            "idle",
+            "idle_in_transaction",
+            "waiting_on_lock"
+          ],
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "longest_transaction_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "server_connections_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "server_max_connections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "odoo_db_maxconn": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "postgresql_version_num": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "system": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "host",
+        "cgroup",
+        "disk",
+        "odoo_processes",
+        "sample_interval_seconds"
+      ],
+      "properties": {
+        "host": {
+          "type": "object",
+          "required": [
+            "cpu_count",
+            "cpu_usage_percent",
+            "load_average",
+            "memory_total_bytes",
+            "memory_available_bytes",
+            "memory_used_percent",
+            "swap_total_bytes",
+            "swap_used_bytes",
+            "process_count"
+          ],
+          "properties": {
+            "cpu_count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "cpu_usage_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "load_average": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "memory_total_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_available_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_used_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "swap_total_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "swap_used_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "process_count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        "cgroup": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "null = no readable cgroup",
+          "required": [
+            "version",
+            "path",
+            "cpu_limit_cores",
+            "cpu_usage_percent",
+            "cpu_throttled_seconds",
+            "memory_usage_bytes",
+            "memory_working_set_bytes",
+            "memory_limit_bytes",
+            "memory_unlimited",
+            "pids_current",
+            "pids_limit"
+          ],
+          "properties": {
+            "version": {
+              "type": "integer",
+              "enum": [
+                1,
+                2
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cpu_limit_cores": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "null = no CPU quota"
+            },
+            "cpu_usage_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100,
+              "description": "of cpu_limit_cores, or of all host cores when no quota"
+            },
+            "cpu_throttled_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "throttled time during the sample interval"
+            },
+            "memory_usage_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_working_set_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_limit_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "null = no limit (see memory_unlimited) or unknown"
+            },
+            "memory_unlimited": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "pids_current": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "pids_limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        "disk": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "path",
+            "total_bytes",
+            "used_bytes",
+            "free_bytes",
+            "used_percent"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "total_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "used_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "free_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "used_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            }
+          }
+        },
+        "odoo_processes": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "count",
+            "rss_bytes",
+            "cpu_usage_percent"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cpu_usage_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Odoo master + children, percent of ALL host cores"
+            }
+          }
+        },
+        "sample_interval_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "collector_errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "collector",
+          "type",
+          "message"
+        ],
+        "properties": {
+          "collector": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 200
+          }
+        }
+      }
+    }
+  }
+}

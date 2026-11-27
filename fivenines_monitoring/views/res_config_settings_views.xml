@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Part of Fivenines Monitoring. License LGPL-3.
+     A standalone form (not an extension of the main Settings page): the main
+     page markup differs between Odoo 16 and 17+, a plain form works on 16-19. -->
+<odoo>
+    <record id="fivenines_settings_view_form" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.fivenines</field>
+        <field name="model">res.config.settings</field>
+        <field name="priority">100</field>
+        <field name="arch" type="xml">
+            <form string="Fivenines Monitoring">
+                <header>
+                    <button string="Save" type="object" name="execute" class="oe_highlight"/>
+                    <button string="Send now" type="object" name="action_fivenines_push_now"/>
+                    <button string="Re-enroll" type="object" name="action_fivenines_reenroll"
+                            confirm="This database will enroll again with the enrollment key and get a new secret. Continue?"/>
+                    <button string="Turn it on" type="object" name="action_fivenines_turn_on"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1>Fivenines Monitoring</h1>
+                        <p>Pushes this database's metrics to Fivenines every minute.
+                           Paste the enrollment key of your Fivenines organization, then Save.
+                           The key is used once, then removed from this database.</p>
+                    </div>
+                    <group string="Enrollment" name="fivenines_enrollment">
+                        <field name="fivenines_enrollment_key" password="True"/>
+                        <field name="fivenines_key_source"/>
+                        <field name="fivenines_paused"/>
+                        <field name="fivenines_send_error_messages"/>
+                        <field name="fivenines_api_url" groups="base.group_no_one"
+                               placeholder="https://api.fivenines.io"/>
+                    </group>
+                    <group string="Status" name="fivenines_status">
+                        <field name="fivenines_state"/>
+                        <field name="fivenines_instance_id"/>
+                        <field name="fivenines_last_push"/>
+                        <field name="fivenines_last_error"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_fivenines_settings" model="ir.actions.act_window">
+        <field name="name">Fivenines Monitoring</field>
+        <field name="res_model">res.config.settings</field>
+        <field name="view_mode">form</field>
+        <field name="view_id" ref="fivenines_settings_view_form"/>
+        <field name="target">current</field>
+    </record>
+
+    <menuitem id="menu_fivenines_settings" name="Fivenines Monitoring"
+              parent="base.menu_administration" action="action_fivenines_settings"
+              sequence="90" groups="base.group_system"/>
+</odoo>

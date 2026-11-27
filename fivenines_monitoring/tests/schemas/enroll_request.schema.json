@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fivenines.io/schemas/odoo/enroll_request.v1.json",
+  "title": "Fivenines Odoo enrollment request (POST /odoo/v1/enroll)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "credential",
+    "reason",
+    "previous_instance_id",
+    "changed",
+    "key_source",
+    "instance"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "credential": {
+      "type": "string",
+      "enum": [
+        "enrollment_key",
+        "instance_secret"
+      ],
+      "description": "what the Authorization header carries: the organization's enrollment key, or (a copy announcing itself) the secret of the database it was copied from"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "first_enrollment",
+        "fingerprint_changed",
+        "conflict",
+        "manual"
+      ]
+    },
+    "previous_instance_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "the instance this database was enrolled as before (fingerprint change, 409 conflict, manual re-enroll), null on first enrollment"
+    },
+    "key_source": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "settings",
+        "odoo.conf",
+        "environment",
+        null
+      ],
+      "description": "where the module found the enrollment key; null when credential is instance_secret"
+    },
+    "instance": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "fingerprint_components",
+        "database",
+        "database_uuid",
+        "base_url",
+        "odoo_stage",
+        "odoo_version",
+        "odoo_serie",
+        "odoo_version_info",
+        "edition",
+        "module_version",
+        "python_version",
+        "hostname",
+        "workers",
+        "max_cron_threads",
+        "urls"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "description": "sha256 hex of the canonical JSON (sorted keys) of fingerprint_components",
+          "maxLength": 64
+        },
+        "fingerprint_components": {
+          "type": "object",
+          "required": [
+            "database",
+            "database_uuid",
+            "base_url",
+            "odoo_stage",
+            "neutralized"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "database": {
+              "type": "string",
+              "description": "PostgreSQL database name"
+            },
+            "database_uuid": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ir.config_parameter database.uuid"
+            },
+            "base_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "web.base.url, normalized: lowercase scheme and host, default port and trailing slash dropped"
+            },
+            "odoo_stage": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ODOO_STAGE environment variable on Odoo.sh (production, staging, dev); null when self-hosted"
+            },
+            "neutralized": {
+              "type": "boolean",
+              "description": "database.is_neutralized (Odoo's neutralization, 16+): a neutralized database is a copy"
+            }
+          }
+        },
+        "database": {
+          "type": "string"
+        },
+        "database_uuid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_stage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_version": {
+          "type": "string",
+          "description": "odoo.release.version, e.g. 19.0 or 17.0+e"
+        },
+        "odoo_serie": {
+          "type": "string",
+          "description": "odoo.release.serie, e.g. 19.0"
+        },
+        "odoo_version_info": {
+          "type": "array",
+          "description": "odoo.release.version_info"
+        },
+        "edition": {
+          "type": "string",
+          "enum": [
+            "community",
+            "enterprise"
+          ]
+        },
+        "module_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "workers": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_cron_threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "urls": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "description": "every URL the database knows: base_url first, then the website domains (website.domain), normalized like base_url; may be empty. Not part of the fingerprint"
+        }
+      }
+    },
+    "changed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "database",
+          "database_uuid",
+          "base_url",
+          "odoo_stage",
+          "neutralized"
+        ]
+      },
+      "description": "for fingerprint_changed: the components that differ from the stored fingerprint; else empty"
+    }
+  }
+}

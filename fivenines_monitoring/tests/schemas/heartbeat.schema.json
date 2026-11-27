@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fivenines Odoo paused heartbeat (POST /odoo/v1/collect, kind heartbeat)",
+  "description": "Sent every every_seconds while Pause monitoring is on: no metrics, no counters. Contract section 4, Paused heartbeat. The instance object is the push payload's (kept identical by the module's tests).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "state",
+    "sent_at",
+    "paused_since",
+    "every_seconds",
+    "instance"
+  ],
+  "properties": {
+    "schema_version": {
+      "enum": [
+        1
+      ]
+    },
+    "kind": {
+      "enum": [
+        "heartbeat"
+      ]
+    },
+    "state": {
+      "enum": [
+        "paused"
+      ]
+    },
+    "sent_at": {
+      "type": "number"
+    },
+    "paused_since": {
+      "type": "number",
+      "description": "When this database was seen paused first (module side)."
+    },
+    "every_seconds": {
+      "type": "integer",
+      "minimum": 60,
+      "description": "The heartbeat pace. The server shows Paused while the last heartbeat is newer than the last metrics push and younger than 3 x every_seconds."
+    },
+    "instance": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "fingerprint_components",
+        "database",
+        "database_uuid",
+        "base_url",
+        "odoo_stage",
+        "odoo_version",
+        "odoo_serie",
+        "odoo_version_info",
+        "edition",
+        "module_version",
+        "python_version",
+        "hostname",
+        "workers",
+        "max_cron_threads",
+        "instance_id",
+        "fingerprint_change",
+        "urls"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "description": "sha256 hex of the canonical JSON (sorted keys) of fingerprint_components",
+          "maxLength": 64
+        },
+        "fingerprint_components": {
+          "type": "object",
+          "required": [
+            "database",
+            "database_uuid",
+            "base_url",
+            "odoo_stage",
+            "neutralized"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "database": {
+              "type": "string",
+              "description": "PostgreSQL database name"
+            },
+            "database_uuid": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ir.config_parameter database.uuid"
+            },
+            "base_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "web.base.url, normalized: lowercase scheme and host, default port and trailing slash dropped"
+            },
+            "odoo_stage": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "ODOO_STAGE environment variable on Odoo.sh (production, staging, dev); null when self-hosted"
+            },
+            "neutralized": {
+              "type": "boolean",
+              "description": "database.is_neutralized (Odoo's neutralization, 16+): a neutralized database is a copy"
+            }
+          }
+        },
+        "database": {
+          "type": "string"
+        },
+        "database_uuid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_stage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "odoo_version": {
+          "type": "string",
+          "description": "odoo.release.version, e.g. 19.0 or 17.0+e"
+        },
+        "odoo_serie": {
+          "type": "string",
+          "description": "odoo.release.serie, e.g. 19.0"
+        },
+        "odoo_version_info": {
+          "type": "array",
+          "description": "odoo.release.version_info"
+        },
+        "edition": {
+          "type": "string",
+          "enum": [
+            "community",
+            "enterprise"
+          ]
+        },
+        "module_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "workers": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_cron_threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "fingerprint_change": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "base_url_changed",
+            null
+          ],
+          "description": "set on every push from a base_url change until one is acknowledged"
+        },
+        "urls": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "description": "every URL the database knows: base_url first, then the website domains (website.domain), normalized like base_url; may be empty. Not part of the fingerprint"
+        }
+      }
+    }
+  }
+}

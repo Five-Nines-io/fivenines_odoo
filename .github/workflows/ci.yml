@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Publish job: build the 16.0-20.0 branches without pushing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile
+        run: python -m compileall -q fivenines_monitoring tools
+      - name: Pyflakes
+        # package __init__ files only import submodules (Odoo convention)
+        run: pip install -q pyflakes && pyflakes $(git ls-files '*.py' | grep -v '__init__.py$')
+      - name: XML well-formed
+        run: |
+          for f in $(git ls-files '*.xml'); do python -c "import sys, xml.dom.minidom as m; m.parse(sys.argv[1])" "$f"; done
+      - name: JSON schemas parse
+        run: for f in fivenines_monitoring/tests/schemas/*.json; do python -m json.tool "$f" > /dev/null; done
+      - name: No em dash (U+2014)
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          bad = []
+          for path in subprocess.check_output(['git', 'ls-files'], text=True).split():
+              if path == 'LICENSE' or path.endswith('.png'):
+                  continue
+              for n, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
+                  if '\u2014' in line:
+                      bad.append('%s:%d' % (path, n))
+          print('\n'.join(bad))
+          sys.exit(1 if bad else 0)
+          PY
+
+  test:
+    name: test (Odoo ${{ matrix.odoo }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        odoo: ["16.0", "17.0", "18.0", "19.0", "20.0"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U odoo" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull the official Odoo image
+        run: docker pull odoo:${{ matrix.odoo }}
+      - name: Install the module and run its tests
+        run: |
+          set -o pipefail
+          # The image entrypoint adds --db_host/--db_user/--db_password from HOST/USER/PASSWORD.
+          docker run --rm --network host \
+            -e HOST=127.0.0.1 -e USER=odoo -e PASSWORD=odoo \
+            -v "${{ github.workspace }}:/mnt/extra-addons:ro" \
+            odoo:${{ matrix.odoo }} -- \
+            -d fivenines_ci -i fivenines_monitoring --test-tags /fivenines_monitoring \
+            --addons-path=/mnt/extra-addons --http-port=8069 --stop-after-init \
+            --log-level=info 2>&1 | tee odoo.log
+      - name: Check the test result line
+        run: |
+          # at least one test must have run ("of 0 tests" is how a bad tag passes)
+          grep -E "odoo.tests.result: 0 failed, 0 error\(s\) of [1-9][0-9]* tests" odoo.log
+          if grep -E " (ERROR|CRITICAL) fivenines_ci " odoo.log; then echo "errors logged"; exit 1; fi
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odoo-${{ matrix.odoo }}-log
+          path: odoo.log
+
+  # Publishes the module to the 16.0-20.0 branches the Odoo Apps Store reads,
+  # changing only the version in __manifest__.py. Manual only, dry run by
+  # default: nothing is pushed unless dry_run is unchecked on main.
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        serie: ["16.0", "17.0", "18.0", "19.0", "20.0"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the ${{ matrix.serie }} tree
+        run: |
+          set -e
+          version=$(python3 -c "import ast; print(ast.literal_eval(open('fivenines_monitoring/__manifest__.py').read())['version'])")
+          case "$version" in *.*.*.*.*) echo "manifest version must not carry a serie: $version"; exit 1;; esac
+          out=$(mktemp -d)
+          cp -r fivenines_monitoring LICENSE README.md "$out/"
+          sed -i "s/'version': '$version'/'version': '${{ matrix.serie }}.$version'/" "$out/fivenines_monitoring/__manifest__.py"
+          grep -q "'version': '${{ matrix.serie }}.$version'" "$out/fivenines_monitoring/__manifest__.py"
+          git config user.name "fivenines-bot"
+          git config user.email "bot@fivenines.io"
+          git worktree add --detach ../publish
+          cd ../publish
+          if git ls-remote --exit-code --heads origin "${{ matrix.serie }}" > /dev/null; then
+            git fetch origin "${{ matrix.serie }}" && git checkout -B "${{ matrix.serie }}" "origin/${{ matrix.serie }}"
+          else
+            git checkout --orphan "${{ matrix.serie }}"
+          fi
+          git rm -rq . > /dev/null 2>&1 || true
+          cp -r "$out"/. .
+          git add -A
+          git commit -qm "Publish fivenines_monitoring ${{ matrix.serie }}.$version from ${GITHUB_SHA::8}" || echo "no change"
+          git log --oneline -1
+          git show --stat HEAD | head -30
+      - name: Push (only when dry_run is false, from main)
+        if: github.ref == 'refs/heads/main' && inputs.dry_run == false
+        run: cd ../publish && git push origin "${{ matrix.serie }}"

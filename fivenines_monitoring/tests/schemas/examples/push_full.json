@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "kind": "metrics",
+  "sent_at": 1764243600.028,
+  "stream_id": "5f0c2b9e7a1d4e3f8b6a0c9d2e1f4a7b",
+  "seq": 2,
+  "window": {
+    "start": 1764243540.016,
+    "end": 1764243600.028,
+    "seconds": 60.012,
+    "baseline_reset": false
+  },
+  "instance": {
+    "fingerprint": "acaa122f6652bffedb182f31e31ea85d8f8851021b75e35f690a616f960c65e5",
+    "fingerprint_components": {
+      "database": "odoo",
+      "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+      "base_url": "https://erp.example.com",
+      "odoo_stage": null,
+      "neutralized": false
+    },
+    "database": "odoo",
+    "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+    "base_url": "https://erp.example.com",
+    "odoo_stage": null,
+    "urls": [
+      "https://erp.example.com"
+    ],
+    "odoo_version": "19.0",
+    "odoo_serie": "19.0",
+    "odoo_version_info": [
+      19,
+      0,
+      0,
+      "final",
+      0,
+      ""
+    ],
+    "edition": "community",
+    "module_version": "19.0.1.0",
+    "python_version": "3.11.2",
+    "hostname": "odoo-vm",
+    "workers": 0,
+    "max_cron_threads": 2,
+    "instance_id": "odi_3f9a2c71d0e4",
+    "fingerprint_change": null
+  },
+  "process": {
+    "pid": 41234,
+    "started_at": 1764243599.271,
+    "mode": "threaded",
+    "workers": [],
+    "request_capture": "forced"
+  },
+  "events": [],
+  "http": {
+    "requests_total": 24,
+    "requests_by_status": {
+      "1xx": 0,
+      "2xx": 21,
+      "3xx": 0,
+      "4xx": 3,
+      "5xx": 0,
+      "other": 0
+    },
+    "requests_per_minute": 23.995,
+    "timed_requests": 24,
+    "latency_ms": {
+      "p50": 46.9,
+      "p95": 94.5,
+      "p99": 98.9,
+      "mean": 46.5
+    },
+    "latency_histogram": {
+      "bounds_ms": [
+        5,
+        10,
+        25,
+        50,
+        100,
+        250,
+        500,
+        1000,
+        2500,
+        5000,
+        10000,
+        30000,
+        60000
+      ],
+      "counts": [
+        0,
+        0,
+        5,
+        8,
+        11,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sql_queries_total": 168,
+    "sql_time_ms_total": 108.0,
+    "sql_queries_per_request": 7.0,
+    "sql_time_ms_per_request": 4.5
+  },
+  "logs": {
+    "messages": "on",
+    "warning_count": 0,
+    "error_count": 1,
+    "critical_count": 0,
+    "fingerprints": [
+      {
+        "count": 1,
+        "logger": "odoo.addons.sale.models.sale_order",
+        "level": "ERROR",
+        "message_template": "Sync of order %s failed: %s",
+        "exception_type": "ValueError",
+        "exception_origin": "odoo/addons/sale/models/sale_order.py:812 _sync_remote",
+        "location": "odoo/addons/sale/models/sale_order.py:820",
+        "fingerprint": "9c1d0e7a5b3f2a61",
+        "last_seen_at": 1764243600.027,
+        "last_message": "Sync of order SO042 failed: password=***",
+        "last_traceback": "Traceback (most recent call last):\n  File \"/opt/odoo/addons/sale/models/sale_order.py\", line 812, in _sync_remote\n    raise ValueError(\"remote refused\")\nValueError: remote refused\n"
+      }
+    ],
+    "fingerprints_truncated": false
+  },
+  "crons": {
+    "active_count": 2,
+    "due_count": 2,
+    "overdue_count": 0,
+    "running_count": 0,
+    "late_count": 0,
+    "stuck_count": 0,
+    "failing_count": 0,
+    "failure_fields_available": true,
+    "late_threshold_seconds": 300,
+    "stuck_threshold_seconds": 1800,
+    "jobs": [],
+    "jobs_truncated": false
+  },
+  "database": {
+    "size_bytes": 22420503,
+    "connections": {
+      "total": 2,
+      "active": 1,
+      "idle": 1,
+      "idle_in_transaction": 0,
+      "waiting_on_lock": 0
+    },
+    "longest_transaction_seconds": null,
+    "server_connections_total": 3,
+    "server_max_connections": 300,
+    "odoo_db_maxconn": 64,
+    "postgresql_version_num": 160014
+  },
+  "system": {
+    "host": {
+      "cpu_count": 16,
+      "cpu_usage_percent": 21.74,
+      "load_average": [
+        1.8,
+        4.88,
+        11.32
+      ],
+      "memory_total_bytes": 65839067136,
+      "memory_available_bytes": 56909639680,
+      "memory_used_percent": 13.6,
+      "swap_total_bytes": 2147479552,
+      "swap_used_bytes": 1549254656,
+      "process_count": 144
+    },
+    "cgroup": {
+      "version": 2,
+      "path": "/",
+      "cpu_limit_cores": null,
+      "cpu_usage_percent": 7.88,
+      "cpu_throttled_seconds": 0.0,
+      "memory_usage_bytes": 23215931392,
+      "memory_working_set_bytes": 9525272576,
+      "memory_limit_bytes": null,
+      "memory_unlimited": true,
+      "pids_current": 1506,
+      "pids_limit": 75248
+    },
+    "disk": {
+      "path": "/var/lib/odoo",
+      "total_bytes": 302134525952,
+      "used_bytes": 168658718720,
+      "free_bytes": 121015033856,
+      "used_percent": 58.2
+    },
+    "odoo_processes": {
+      "count": 1,
+      "rss_bytes": 113795072,
+      "cpu_usage_percent": 2.25
+    },
+    "sample_interval_seconds": 0.028
+  },
+  "collector_errors": []
+}
