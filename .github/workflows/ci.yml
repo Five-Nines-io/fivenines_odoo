@@ -82,7 +82,8 @@ jobs:
             --log-level=info 2>&1 | tee odoo.log
       - name: Check the test result line
         run: |
-          grep -E "odoo.tests.result: 0 failed, 0 error\(s\) of [0-9]+ tests" odoo.log
+          # at least one test must have run ("of 0 tests" is how a bad tag passes)
+          grep -E "odoo.tests.result: 0 failed, 0 error\(s\) of [1-9][0-9]* tests" odoo.log
           if grep -E " (ERROR|CRITICAL) fivenines_ci " odoo.log; then echo "errors logged"; exit 1; fi
       - name: Upload the log
         if: always()

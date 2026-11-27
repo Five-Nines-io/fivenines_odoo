@@ -16,3 +16,15 @@ Key routing rules:
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 - Author a backlog-ready spec/issue → invoke /spec
+
+## Testing
+
+- Module tests (Odoo test framework), Odoo 16, 17, 18 and 19 from source, in parallel:
+  `ODOO_SRC=/home/paseo/odoo-src DB_USER=paseo tools/run_tests.sh`
+  (`ODOO_SRC` holds `odoo-<version>/` checkouts and `venv-<version>/` virtualenvs.)
+- Tests live in `fivenines_monitoring/tests/` (`test_lib.py` pure units, `test_push.py`
+  against the stub in `tests/stub_server.py`). CI runs the same suite on the official
+  `odoo:<version>` Docker images (`.github/workflows/ci.yml`).
+- End-to-end on a real server: `tools/e2e_local.py` (see README).
+- When writing new functions, write a corresponding test; when fixing a bug, write a
+  regression test; never commit code that makes existing tests fail.
