@@ -7,13 +7,11 @@ and a short server message only.
 """
 
 import gzip
+import ipaddress
 import json
-import logging
 from urllib.parse import urlsplit
 
 import requests
-
-_logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = 'https://api.fivenines.io'
 ENROLL_PATH = '/odoo/v1/enroll'
@@ -55,8 +53,18 @@ class Result:
 
 
 def is_loopback(host):
-    host = (host or '').lower().strip('[]')
-    return host in ('localhost', '::1') or host.startswith('127.')
+    """True for localhost and loopback IP literals only.
+
+    Parsed as an IP address, never by prefix: '127.example.com' is a DNS name
+    that can resolve anywhere and must not get the plain-http exemption.
+    """
+    host = (host or '').strip().strip('[]').split('%', 1)[0].lower()
+    if host == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def check_api_url(url, allow_insecure=False):
@@ -102,11 +110,9 @@ def classify(status, body, retry_after=None):
 
 
 class Client:
-    def __init__(self, base_url, user_agent, timeout=TIMEOUT, session=None):
+    def __init__(self, base_url, user_agent):
         self.base_url = base_url
         self.user_agent = user_agent
-        self.timeout = timeout
-        self.session = session or requests
 
     def _post(self, path, token, payload):
         body = gzip.compress(json.dumps(payload, separators=(',', ':'), default=str).encode('utf-8'))
@@ -118,9 +124,9 @@ class Client:
             'User-Agent': self.user_agent,
         }
         try:
-            response = self.session.post(
+            response = requests.post(
                 self.base_url + path, data=body, headers=headers,
-                timeout=self.timeout, allow_redirects=False)
+                timeout=TIMEOUT, allow_redirects=False)
         except requests.exceptions.Timeout:
             return Result(RETRY, None, message='timeout')
         except requests.exceptions.RequestException as e:

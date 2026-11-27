@@ -329,17 +329,22 @@ class Handler(BaseHTTPRequestHandler):
                                     'errors': errors[:20]})
         now = time.time()
         fingerprint = body['instance']['fingerprint']
+        process = body.get('process') or {}
+        identity = (body['instance'].get('hostname'), process.get('pid'), process.get('started_at'))
         with st.lock:
+            status = None
             if fingerprint != inst['fingerprint']:
+                # contract s5: the same running server changed its URL -> adopt;
+                # another place while the old one pushed < 15 min ago -> 409;
+                # the old place silent for 15 min -> a move, adopt
+                same_process = identity == inst.get('last_identity')
                 live = inst['last_fingerprint_push_at'] and now - inst['last_fingerprint_push_at'] < CONFLICT_WINDOW
-                if live and body['instance'].get('fingerprint_change') != 'base_url_from_loopback':
+                if live and not same_process:
                     status = 409
                 else:
-                    inst['fingerprint'] = fingerprint  # a move: adopt
-                    status = None
-            else:
-                status = None
+                    inst['fingerprint'] = fingerprint
             if status is None:
+                inst['last_identity'] = identity
                 inst['last_fingerprint_push_at'] = now
                 inst['last_push_at'] = now
                 inst['push_count'] += 1

@@ -172,6 +172,30 @@ class TestCollector(BaseCase):
         self.assertNotIn('S0001', json.dumps(fps))
         self.assertNotIn('secret customer value', json.dumps(fps))
 
+    def test_preformatted_messages_are_masked(self):
+        # Value: protects=messages formatted before logging (f-string, str(e)) leave the instance with values masked, and variants share one fingerprint; fails_when=record.msg is sent verbatim when there are no args; why_new=red-team RT4 (customer data in templates); seam=none; no_claim=every PII shape (regex masks)
+        def emit(msg, args=None):
+            self.handler.emit(logging.LogRecord('odoo.sql_db', logging.ERROR, '/x/odoo/sql_db.py', 10, msg, args, None))
+
+        _Thread.run('db_a', lambda: (
+            emit('duplicate key value: Key (email)=(john@example.com) already exists, id 42'),
+            emit('duplicate key value: Key (email)=(mary@example.com) already exists, id 77'),
+            emit('Order %s failed', ('S0001',))))
+        fps = self.collector.snapshot('db_a')['logs']['fingerprints']
+        text = json.dumps(fps)
+        for value in ('john@', 'mary@', '42', '77'):
+            self.assertNotIn(value, text)
+        self.assertEqual(len(fps), 2, 'the two pre-formatted variants share one fingerprint')
+        templates = sorted(e['message_template'] for e in fps.values())
+        self.assertIn('Order %s failed', templates)  # a real template is kept as is
+
+    def test_prefork_master_is_ignored(self):
+        # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork
+        self.collector.ignore_pid = os.getpid()
+        _Thread.run('db_a', lambda: self.handler.emit(_request_record(200)))
+        self.assertIsNone(self.collector.snapshot('db_a'))
+        self.assertIsNone(self.collector._thread)
+
     def test_flush_writes_atomically(self):
         _Thread.run('db_a', lambda: self.handler.emit(_request_record(200)))
         self.collector.flush()
@@ -352,6 +376,13 @@ class TestClient(BaseCase):
     def test_check_api_url(self):
         self.assertEqual(fn_client.check_api_url('https://api.fivenines.io/'), 'https://api.fivenines.io')
         self.assertEqual(fn_client.check_api_url('http://127.0.0.1:8899'), 'http://127.0.0.1:8899')
+        self.assertEqual(fn_client.check_api_url('http://[::1]:8899'), 'http://[::1]:8899')
+        self.assertEqual(fn_client.check_api_url('http://localhost:8899'), 'http://localhost:8899')
+        # Value: protects=plain http only to real loopback addresses; fails_when=a DNS name that looks like an IP (127.example.com) gets the exemption; why_new=security finding S1; seam=none; no_claim=DNS resolution
+        for name in ('127.example.com', '127.0.0.1.nip.io', 'localhost.example.com'):
+            self.assertFalse(fn_client.is_loopback(name), name)
+            with self.assertRaises(ValueError):
+                fn_client.check_api_url('http://%s' % name)
         with self.assertRaises(ValueError):
             fn_client.check_api_url('http://api.fivenines.io')
         self.assertEqual(fn_client.check_api_url('http://10.0.0.5', allow_insecure=True), 'http://10.0.0.5')
@@ -368,6 +399,24 @@ class TestClient(BaseCase):
         self.assertEqual(fn_client.classify(429, None, 30).retry_after, 30)
         for status in (404, 500, 502, 503, 504):
             self.assertEqual(fn_client.classify(status, None).kind, fn_client.RETRY)
+        # Value: protects=403 holds (instance limit), 402 holds, 400/413 are rejected not retried; fails_when=status map edited; why_new=only 401/409/422/429 asserted; seam=none; no_claim=handler effects
+        self.assertEqual(fn_client.classify(403, None).kind, fn_client.FORBIDDEN)
+        self.assertEqual(fn_client.classify(402, None).kind, fn_client.PAYMENT_REQUIRED)
+        for status in (400, 413):
+            self.assertEqual(fn_client.classify(status, None).kind, fn_client.REJECTED)
+
+    def test_retry_after_header(self):
+        # Value: protects=Retry-After parsed, clamped to [0, MAX_RETRY_AFTER], junk ignored; fails_when=clamp/parse removed so server can stall pushes or crash; why_new=_retry_after untested; seam=none; no_claim=HTTP-date form
+        class _Resp:
+            def __init__(self, value):
+                self.headers = {} if value is None else {'Retry-After': value}
+        ra = fn_client._retry_after
+        self.assertEqual(ra(_Resp('120')), 120)
+        self.assertEqual(ra(_Resp('1.5')), 1)
+        self.assertEqual(ra(_Resp('-5')), 0)
+        self.assertEqual(ra(_Resp('99999999')), fn_client.MAX_RETRY_AFTER)
+        self.assertIsNone(ra(_Resp('Wed, 21 Oct 2015 07:28:00 GMT')))
+        self.assertIsNone(ra(_Resp(None)))
 
     def test_backoff_is_bounded(self):
         delays = [fn_client.backoff_delay(n) for n in range(1, 12)]

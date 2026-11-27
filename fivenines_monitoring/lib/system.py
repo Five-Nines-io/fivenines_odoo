@@ -42,7 +42,7 @@ def _kv(text):
     return out
 
 
-def _self_cgroups(root, proc_cgroup):
+def _self_cgroups(proc_cgroup):
     """{controller: path} (v1) and the '' entry (v2) from /proc/self/cgroup."""
     out = {}
     for line in (_read(proc_cgroup) or '').splitlines():
@@ -68,7 +68,7 @@ def _pick_dir(base, path):
 
 def read_cgroup(root=CGROUP_ROOT, proc_cgroup='/proc/self/cgroup'):
     """Raw cgroup counters, or None when there is no readable cgroup."""
-    paths = _self_cgroups(root, proc_cgroup)
+    paths = _self_cgroups(proc_cgroup)
     if os.path.exists(os.path.join(root, 'cgroup.controllers')):
         d = _pick_dir(root, paths.get(''))
         cpu_max = (_read(os.path.join(d, 'cpu.max')) or '').split()

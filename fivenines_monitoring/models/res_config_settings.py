@@ -46,7 +46,7 @@ class ResConfigSettings(models.TransientModel):
         if status['paused']:
             state = _('Paused')
         elif status['status'] == 'revoked':
-            state = _('Revoked in Fivenines: click "Re-enroll" to resume')
+            state = _('Refused by Fivenines (revoked?): retried once a day; click "Re-enroll" to start over')
         elif status['status'] == 'enrollment_refused':
             state = _('Enrollment key refused by Fivenines')
         elif status['enrolled']:
@@ -90,11 +90,25 @@ class ResConfigSettings(models.TransientModel):
             'busy': (_('A push is already running, try again in a few seconds.'), 'warning'),
             'revoked': (_('This instance was revoked in Fivenines.'), 'danger'),
             'enrollment_refused': (_('Fivenines refused the enrollment key.'), 'danger'),
+            'backoff': (_('Fivenines is unreachable, the next attempt is scheduled.'), 'warning'),
+            'config_error': (_('Configuration error: %s') % (outcome.get('message') or ''), 'warning'),
+            'error': (_('The push failed on this server: %s') % (outcome.get('message') or ''), 'danger'),
         }
-        message, kind = messages.get(result, (
-            _('Fivenines answered: %s') % ' '.join(
-                str(v) for v in (outcome.get('status'), outcome.get('kind'), outcome.get('message')) if v),
-            'danger'))
+        if result == 'conflict':
+            # the secret was in use elsewhere: this database enrolled anew
+            message, kind = (
+                (_('This database was reporting with the secret of another place: '
+                   'it enrolled as a new instance.'), 'success')
+                if outcome.get('enroll') == 'enrolled' else
+                (_('This database was reporting with the secret of another place; '
+                   'enrolling as a new instance failed, it will retry.'), 'warning'))
+        else:
+            # never echo the server's own text here: the URL may not be Fivenines
+            message, kind = messages.get(result, (
+                _('Fivenines answered: %s') % ' '.join(
+                    str(v) for v in (('HTTP %s' % outcome['status']) if outcome.get('status') else None,
+                                     outcome.get('kind')) if v),
+                'danger'))
         return {
             'type': 'ir.actions.client',
             'tag': 'display_notification',

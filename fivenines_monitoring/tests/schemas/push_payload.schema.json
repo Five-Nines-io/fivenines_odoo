@@ -6,6 +6,7 @@
   "required": [
     "schema_version",
     "sent_at",
+    "stream_id",
     "seq",
     "window",
     "instance",
@@ -29,6 +30,11 @@
       "type": "number",
       "minimum": 0,
       "description": "Unix time, seconds (float)"
+    },
+    "stream_id": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "random id of this counter stream; a new one starts with every baseline reset (seq restarts at 1). Dedup by (stream_id, seq)"
     },
     "seq": {
       "type": "integer",
@@ -202,9 +208,10 @@
             "null"
           ],
           "enum": [
-            "base_url_from_loopback",
+            "base_url_changed",
             null
-          ]
+          ],
+          "description": "set on every push from a base_url change until one is acknowledged"
         }
       }
     },

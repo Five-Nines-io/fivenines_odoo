@@ -34,9 +34,6 @@ import time
 STATE_FILE = 'state.json'
 LOCK_FILE = 'state.lock'
 _PROC_RE = re.compile(r'^(\d+)-(\d+)\.json$')
-# A spool file not rewritten for this long belongs to a dead (or wedged)
-# process whatever its pid says: drop it after its last delta was pushed.
-STALE_AFTER = 3600
 
 
 def _safe(name):

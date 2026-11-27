@@ -23,7 +23,8 @@
         "first_enrollment",
         "fingerprint_changed",
         "conflict",
-        "manual"
+        "manual",
+        "neutralized_copy"
       ]
     },
     "previous_instance_id": {

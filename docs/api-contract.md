@@ -25,10 +25,13 @@ When this document and a schema disagree, the schema wins. Fix both in the same 
   difference is that the Odoo module has a dedicated enrollment call instead of the agent's
   "first `/collect` carries the enrollment token and the answer carries `token`" swap. That keeps
   the enrollment key out of every metrics request.
-- **Revocation.** Revoking an instance secret cuts that instance only. The module stops and does
-  NOT re-enroll on its own. Revoking the enrollment key blocks new enrollments only.
-- **Copies re-enroll.** The module sends a location fingerprint. When it changes, the module drops
-  its secret and enrolls as a new instance (section 5).
+- **Revocation.** Revoking an instance secret cuts that instance only. The module stops pushing,
+  never re-enrolls on its own, and tries the same secret again once a day (so a server-side
+  mistake heals by itself). Revoking the enrollment key blocks new enrollments only.
+- **Copies re-enroll.** The module sends a location fingerprint. When the database name,
+  `database.uuid` or Odoo.sh stage changes, the module drops its secret and enrolls as a new
+  instance. A `web.base.url` change alone is adopted and flagged; the server tells a second live
+  place apart (section 5).
 - **Unknown is `null`, never `0`.** A `0` in a payload is a measurement. Anything the module could
   not measure is `null` (or the whole block is `null`), and the reason may appear in
   `collector_errors`.
@@ -39,7 +42,8 @@ When this document and a schema disagree, the schema wins. Fix both in the same 
 |---|---|
 | Base URL | `https://api.fivenines.io` (overridable in the module, see the README) |
 | Paths | `POST /odoo/v1/enroll`, `POST /odoo/v1/collect` |
-| TLS | HTTPS only. The module refuses a plain `http://` URL except on loopback (the stub) or when `fivenines_allow_insecure_http = True` is set in the Odoo config file. |
+| TLS | HTTPS only. The module refuses a plain `http://` URL except to a loopback IP literal or `localhost` (the stub; a DNS name such as `127.example.com` is not loopback) or when `fivenines_allow_insecure_http = True` is set in the Odoo config file. |
+| URL source | When the enrollment key comes from the Odoo config file or the environment (server-wide), the API URL comes from the same level or the default, never from one database's Settings: a database administrator cannot redirect the organization key. |
 | Timeout | The module waits 10 s for the connection and 10 s per read, then gives up until the next minute. |
 | Redirects | Not followed. Answer at the URL. |
 
@@ -100,7 +104,7 @@ fingerprint change, after a 409, or when an administrator clicks "Re-enroll".
 | Field | Meaning |
 |---|---|
 | `schema_version` | Always `1` for this contract. |
-| `reason` | `first_enrollment`, `fingerprint_changed` (section 5), `conflict` (after a 409), `manual` ("Re-enroll" button). |
+| `reason` | `first_enrollment`, `fingerprint_changed` (section 5), `conflict` (after a 409), `manual` ("Re-enroll" button), `neutralized_copy` (an Odoo-neutralized copy whose push cron was re-activated, section 5). The reason and `previous_instance_id` are kept until an enrollment succeeds, so a retry after a failure carries them too. |
 | `previous_instance_id` | The instance this database reported as before. `null` on a first enrollment. Lets the server show "copied from X" or offer to merge a move. |
 | `key_source` | Where the module found the key: `settings` (this database), `odoo.conf`, `environment`. |
 | `instance.fingerprint` | sha256 hex of the canonical JSON (sorted keys, `json.dumps(..., sort_keys=True)`) of `fingerprint_components`. |
@@ -138,8 +142,9 @@ Server notes:
 - Store the fingerprint (hash + components) on the instance (needed for the 409 rule).
 - Dedup (optional, mirrors `host_for_dedup`): a `first_enrollment` whose fingerprint equals an
   active instance of the same organization may get that instance back with a rotated token.
-  This covers a module that lost its parameters. Never dedup `fingerprint_changed`, `conflict` or
-  `manual`.
+  This covers a module that lost its parameters. Never dedup `fingerprint_changed`, `conflict`,
+  `manual` or `neutralized_copy`, and never dedup onto an instance that pushed in the last
+  15 minutes (that instance is alive: rotating its token would cut it off).
 
 ## 4. Push: `POST /odoo/v1/collect`
 
@@ -157,8 +162,11 @@ Two kinds of values travel in a push:
 - **Gauges** (`crons`, `database`, `system`, `process`): the state at `sent_at`. Percentages that
   need two samples (CPU) cover `system.sample_interval_seconds` before `sent_at`.
 
-`seq` is `1 +` the seq of the last acknowledged push. A push that failed is resent with the SAME
-seq and a longer window. If the server gets a seq it already accepted, the module never saw the
+`stream_id` names a counter stream: a random id created with every baseline (enrollment, or
+`state.json` lost on a reboot or a container redeploy). `seq` is `1 +` the seq of the last
+acknowledged push **of that stream**, and restarts at 1 with a new `stream_id`. Dedup on
+`(stream_id, seq)`, never on `seq` alone. A push that failed is resent with the SAME stream and
+seq and a longer window. If the server gets a (stream, seq) it already accepted, the module never saw the
 answer (timeout after the server processed it): the window overlaps the accepted one. The server
 should then accept the gauges and keep only the part of the counters it has not stored yet
 (window from the previous `window.end`), or drop the counters of that push. It must answer 200
@@ -180,6 +188,7 @@ wiped). The counters are correct for the window, but nothing before it was count
 |---|---|---|
 | `schema_version` | int | `1` |
 | `sent_at` | float | When the payload was built. |
+| `stream_id` | string | See above. |
 | `seq` | int >= 1 | See above. |
 | `window.start` / `window.end` / `window.seconds` | float | Counter window. |
 | `window.baseline_reset` | bool | See above. |
@@ -193,8 +202,8 @@ wiped). The counters are correct for the window, but nothing before it was count
 | `system` | object or null | Host and container (gauge). |
 | `collector_errors` | array | `{collector, type, message}` for each collector that failed (its block is then `null` or partial). `message` is at most 200 chars. |
 
-`instance.fingerprint_change` is `null`, or `"base_url_from_loopback"` when the module adopted a
-new `web.base.url` because the old one was `localhost`/`127.x` (section 5).
+`instance.fingerprint_change` is `null`, or `"base_url_changed"` on every push from the moment
+the module adopted a new `web.base.url` until one push is acknowledged (section 5).
 
 ### `process`
 
@@ -245,9 +254,13 @@ Long-polling and websocket requests are counted like any request.
 | `fingerprints_truncated` | More groups existed (or a process hit its 100-group cap). |
 
 Grouping key: logger, level, the message TEMPLATE (`record.msg` before `%` substitution, so no
-argument value and no customer data ever leaves the instance), exception type, and the innermost
+argument value ever leaves the instance), exception type, and the innermost
 traceback frame (`exception_origin`, `path:line function`) or else the log call site
 (`location`). `fingerprint` is 16 hex chars, stable across processes and restarts.
+A message formatted before logging (an f-string, `'x %s' % v`, `str(e)`, Werkzeug 1.x lines) has
+no template: its values are masked before grouping and sending (emails, URLs, query values,
+`Key (col)=(value)`, quoted strings, long hex ids and numbers become `<email>`, `<url>`, `?`,
+`=(?)`, `'?'`, `<hex>`, `N`), so its variants also share one fingerprint.
 
 ### `crons`
 
@@ -302,8 +315,8 @@ Read with Odoo's own cursor (no extra connection), excluding the module's own jo
 
 | Status | Meaning | Module behaviour |
 |---|---|---|
-| `200` (any 2xx) | Accepted. Body `{"status": "ok"}`; an optional `config` object is reserved for later and ignored today. | Marks the counters as acknowledged, deletes the spool files of dead processes, resets the failure count. |
-| `401` | Unknown, revoked or disabled instance token. | Drops the secret, records `revoked`, stops. Neither the cron nor "Send now" re-enrolls: re-enrolling on its own would undo the revocation. Only an administrator's "Re-enroll" resumes. A copy of a revoked database (new fingerprint) may enroll. |
+| `200` (any 2xx) | Accepted. Body `{"status": "ok"}`; an optional `config` object is reserved for later and ignored today. | Marks the counters as acknowledged, deletes the spool files of dead processes, resets the failure count, clears a `revoked` status. |
+| `401` | Unknown, revoked or disabled instance token. | Keeps the secret, records `revoked`, stops pushing and tries again once every 24 h ("Send now" tries at once). It never re-enrolls on its own: that would undo the revocation. A later 2xx resumes on the same instance; an administrator's "Re-enroll" starts over as a new instance. A copy of a revoked database (new fingerprint) may enroll. |
 | `402` | Subscription inactive. | Keeps the secret, retries in 1 hour. |
 | `403` | Instance disabled or refused by policy. | Keeps the secret, retries in 1 hour. |
 | `409` | Fingerprint conflict: this token is in use from another location (section 5). | Drops the secret and enrolls again at once, with `reason: "conflict"` and `previous_instance_id`. |
@@ -313,28 +326,39 @@ Read with Odoo's own cursor (no extra connection), excluding the module's own jo
 
 ## 5. Fingerprint and copies
 
-The module compares the current fingerprint with the one stored at enrollment, before every run:
+The module compares the current fingerprint with the one stored at enrollment, before every run
+(before any backoff, so a copy never waits for the original's retry schedule):
 
 - **Equal**: push.
-- **Only `base_url` changed, and the stored one was loopback** (`localhost`, `127.x`, `::1`,
-  empty): the same instance after its first admin login (Odoo rewrites `web.base.url` then).
-  The module adopts the new fingerprint, keeps its secret and sends
-  `instance.fingerprint_change = "base_url_from_loopback"` once.
-- **Anything else changed** (database name, `database.uuid`, public URL, `ODOO_STAGE`): the
-  database was copied (staging from production, a restore elsewhere) or moved. The module drops
-  the copied secret and enrolls with `reason: "fingerprint_changed"` and `previous_instance_id`.
-  Production keeps its own secret, so the two never report as one.
-- Odoo's neutralization (Odoo.sh staging/dev copies, `odoo-bin neutralize`, neutralized
-  duplicates) also deletes the module's secret (`data/neutralize.sql`), and it deactivates every
-  cron, ours included.
+- **Only `base_url` changed**: Odoo rewrites `web.base.url` on every administrator login
+  (unless `web.base.url.freeze` is set), so this is a first login from the real URL or an alias
+  (a LAN IP, a second domain), not a copy. The module adopts the new fingerprint, keeps its
+  secret and sends `instance.fingerprint_change = "base_url_changed"` on every push until one is
+  acknowledged.
+- **The database name, `database.uuid` or `ODOO_STAGE` changed**: the database was copied
+  (staging from production, a restore under another name, Odoo's duplicate which regenerates the
+  uuid). The module drops the copied secret and enrolls with `reason: "fingerprint_changed"` and
+  `previous_instance_id`. Production keeps its own secret, so the two never report as one.
+- **Neutralized copies** (Odoo.sh staging/dev, `odoo-bin neutralize`, neutralized duplicates):
+  `data/neutralize.sql` deletes the secret and the module state and keeps the instance id under
+  `fivenines.copied_from`. Neutralization deactivates every cron, ours included (and the cron
+  record is `noupdate`, so an upgrade does not re-activate it). If an administrator re-activates
+  it, the copy enrolls with `reason: "neutralized_copy"` and `previous_instance_id`.
 
-Server-side safety net (the "409 rule"): the server stores the fingerprint of each instance.
-It **must answer 409** when a push carries a fingerprint different from the stored one **and**
-the stored fingerprint pushed within the last 15 minutes: one token, two live places. Otherwise
-(the old place has been silent for 15 minutes, a move) it may adopt the new fingerprint. It must
-always adopt it when `fingerprint_change = "base_url_from_loopback"`. A copy whose fingerprint
-equals the original's (a byte-identical restore with the same name, uuid and URL) cannot be told
-apart by anyone: it is treated as the same instance.
+Server side, the "409 rule" decides what the module cannot see (two live places with the same
+database name and uuid: a PostgreSQL-level copy on another server). The server stores, per
+instance, the fingerprint and the identity of the last accepted push: `instance.hostname`,
+`process.pid` and `process.started_at`. When a push carries a fingerprint different from the
+stored one:
+
+1. same identity as the last accepted push (the same running server changed its URL): adopt it;
+2. otherwise, if the stored fingerprint pushed within the last 15 minutes (one token, two live
+   places): **answer 409**; the module that gets it enrolls as a new instance;
+3. otherwise (the old place has been silent for 15 minutes: a move): adopt it.
+
+`fingerprint_change` is informational (show "URL changed"); it never bypasses this rule. A copy
+whose fingerprint and identity both equal the original's cannot be told apart by anyone: it is
+treated as the same instance.
 
 ## 6. Security
 
@@ -347,14 +371,17 @@ apart by anyone: it is treated as the same instance.
   administrators only. The settings screen never displays it.
 - The server must not log the `Authorization` header (Rails `filter_parameters` does not cover
   headers; check the request logging).
-- The payload carries no customer data by design: log message templates, not formatted
-  messages; cron names; counts and sizes.
+- The payload carries no customer data by design: log message templates (pre-formatted messages
+  masked, section 4), not formatted messages; cron names; counts and sizes.
 
 ## 7. Retry and backoff (module side)
 
-The cron runs every minute and never blocks: one run makes at most two requests (enroll + push,
-or push + re-enroll after a 409), each bounded by the 10 s timeout. It never raises (Odoo 18+
-deactivates a cron that keeps failing).
+The cron runs every minute and does not hang on a slow answer: one run makes at most three
+requests (enroll, push, and a new enrollment after a 409), each with a 10 s timeout on the
+connection and on every read (requests' timeout is per read, not a total deadline: a server
+that trickles bytes can hold a run longer; on prefork servers `limit_time_real` still kills the
+cron worker). It never raises (Odoo 18+ deactivates a cron that keeps failing), and each SQL
+collector runs in a savepoint, so a failing query only nulls its block.
 
 After a retryable failure (`404`, `5xx`, `400`/`413`/`422`, timeout, connection error):
 
@@ -366,7 +393,7 @@ After a retryable failure (`404`, `5xx`, `400`/`413`/`422`, timeout, connection 
 | 6 | +8 min |
 | 7 and more | +15 min (cap) |
 
-`429` uses `Retry-After`; `402`/`403` wait 1 hour; `401` stops; `409` re-enrolls at once. A
+`429` uses `Retry-After`; `402`/`403` wait 1 hour; `401` waits 24 hours; `409` re-enrolls at once. A
 success resets the count. During the backoff the counters keep accumulating: nothing is lost
 unless the Odoo processes die AND their spool files are wiped before the next successful push.
 
@@ -374,13 +401,15 @@ unless the Odoo processes die AND their spool files are wiped before the next su
 
 | Where | What |
 |---|---|
-| `ir.config_parameter` | `fivenines.enrollment_key` (if set in Settings), `fivenines.api_url`, `fivenines.paused`, `fivenines.instance_secret`, `fivenines.instance_id`, `fivenines.fingerprint` (hash + components), `fivenines.enrolled_at`, `fivenines.status` (revoked / enrollment refused), `fivenines.server_identity` (last acknowledged master pid + start time). Written rarely: every write invalidates the ORM caches of all workers. |
+| `ir.config_parameter` | `fivenines.enrollment_key` (if set in Settings), `fivenines.api_url`, `fivenines.paused`, `fivenines.instance_secret`, `fivenines.instance_id`, `fivenines.fingerprint` (hash + components), `fivenines.enrolled_at`, `fivenines.status` (revoked / enrollment refused), `fivenines.server_identity` (last acknowledged master pid + start time), `fivenines.copied_from` (set by neutralization). Written rarely: every write invalidates the ORM caches of all workers. |
 | `<tmp>/fivenines-<uid>/<db>-<hash8>/<pid>-<start>.json` | Cumulative counters of one Odoo process, flushed every 10 s and at exit (atomic rename). |
-| same dir, `state.json` | Acknowledged baselines, `seq`, backoff, last result. `state.lock` serializes pushes (flock). |
+| same dir, `state.json` | Acknowledged baselines, `stream` and `seq`, backoff, a pending enrollment reason, a pending `fingerprint_change`, last result. `state.lock` serializes pushes (flock). |
 
 `<hash8>` = sha1 of `db_host:db_port:dbname`, so two Odoo servers on one machine with the same
 database name do not mix. `<pid>-<start>` keeps a dead process's last counters from being
-overwritten by a new process that got the same pid (common in containers).
+overwritten by a new process that got the same pid (common in containers). A file is deleted
+only once its process is dead (pid gone, or another start time) and its last counters were
+acknowledged; a live worker keeps its file however long it has been idle.
 
 ## 9. Implementing the server side (checklist for the fivenines-server PR)
 
@@ -389,11 +418,13 @@ overwritten by a new process that got the same pid (common in containers).
 2. A model for Odoo instances (or `Host` with a new `source`), belonging to an organization and
    to the `EnrollmentToken` that created it: `instance_id` (public string), `token` (unique,
    `SecureRandom.hex(32)`), `revoked_at`, `disabled`, fingerprint hash + components,
-   `previous_instance_id`, `last_push_at`, `last_seq`, `last_window_end`.
+   `previous_instance_id`, `last_push_at`, `last_identity` (hostname, pid, started_at),
+   `last_stream_id`, `last_seq`, `last_window_end`.
 3. Enrollment: section 3 (401 / 402 / 403 like `/collect`, `hosts_registered_count`,
    `last_used_at`, optional uptime monitor on `base_url`).
 4. Collect: authenticate by token (401), subscription (402), 409 rule (section 5), validate
-   against the schema (422 with a short `message`), dedup by `seq` (section 4), store, 200.
+   against the schema (422 with a short `message`), dedup by `(stream_id, seq)` (section 4),
+   store, 200.
 5. UI: list instances under the organization, revoke one, show "copied from" via
    `previous_instance_id`, show `server_restart` as an event, not as a gap.
 6. Contract tests: post the stub's fixtures (`tests/schemas`) and the payloads the module's

@@ -18,6 +18,7 @@ The handler never raises and never logs.
 """
 
 import atexit
+import copy
 import hashlib
 import logging
 import os
@@ -26,8 +27,6 @@ import threading
 import time
 
 from . import spool, stats
-
-_logger = logging.getLogger(__name__)
 
 FLUSH_INTERVAL = 10
 _ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
@@ -107,15 +106,40 @@ def _short_path(path):
     return os.path.basename(path)
 
 
+# Masks for messages that were formatted BEFORE logging (f-strings,
+# `_logger.error('x %s' % v)`, `_logger.error(str(e))`, Werkzeug 1.x lines):
+# there is no template, so values are blanked out instead. Order matters.
+_MASKS = (
+    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
+    (re.compile(r'\b[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
+    (re.compile(r'([?&][^=\s&]+)=[^&\s]*'), r'\1=?'),  # query strings
+    (re.compile(r'=\([^)]*\)'), '=(?)'),            # psycopg2: Key (email)=(x)
+    (re.compile(r'"[^"]*"'), '"?"'),
+    (re.compile(r"'[^']*'"), "'?'"),
+    (re.compile(r'\b[0-9a-f]{8,}\b', re.I), '<hex>'),
+    (re.compile(r'\d+(?:[.,:]\d+)*'), 'N'),
+)
+
+
+def mask_values(text):
+    for pattern, replacement in _MASKS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def log_fingerprint(record):
     """(fingerprint, info) grouping a log record by where it comes from.
 
     Uses the message TEMPLATE (record.msg, before % args), the exception type
     and the innermost traceback frame, so one root cause is one fingerprint and
-    no argument value (customer data) ever leaves the instance.
+    no argument value (customer data) ever leaves the instance. A message that
+    arrives already formatted (no args) has no template: its values (numbers,
+    quoted strings, emails, URLs, ids) are masked instead.
     """
     template = record.msg if isinstance(record.msg, str) else type(record.msg).__name__
     template = strip_ansi(template).strip()
+    if not record.args:
+        template = mask_values(template)
     exc_type = None
     origin = None
     if record.exc_info and record.exc_info[0] is not None:
@@ -162,6 +186,8 @@ class FiveninesHandler(logging.Handler):
 
     def emit(self, record):
         try:
+            if self.collector.ignore_pid == os.getpid():
+                return  # prefork master (see Collector.ignore_pid)
             thread = threading.current_thread()
             dbname = getattr(thread, 'dbname', None)
             if not dbname or dbname not in self.collector.dbs:
@@ -195,6 +221,10 @@ class Collector:
     def __init__(self):
         self.dbs = {}  # dbname -> spool directory
         self.handler = None
+        # The prefork master serves no request: counting there would attribute
+        # its own warnings to the last preloaded database and start the flusher
+        # thread before the workers are forked. Set by the Odoo model.
+        self.ignore_pid = None
         self.werkzeug_capture = None  # 'native' | 'forced' | 'disabled'
         self._reset_process()
         if hasattr(os, 'register_at_fork'):
@@ -311,14 +341,14 @@ class Collector:
         with self._lock:
             self._check_fork()
             data = self._data.get(dbname)
-            return None if data is None else _deepcopy(data)
+            return None if data is None else copy.deepcopy(data)
 
     def flush(self, dbname=None):
         """Write this process's cumulative counters (atomic rename)."""
         with self._lock:
             self._check_fork()
             names = [dbname] if dbname else list(self._dirty)
-            todo = [(n, _deepcopy(self._data[n])) for n in names if n in self._data]
+            todo = [(n, copy.deepcopy(self._data[n])) for n in names if n in self._data]
             self._dirty.difference_update(names)
         started_at = self.started_at
         for name, data in todo:
@@ -341,10 +371,6 @@ class Collector:
                 with self._lock:
                     self._dirty.add(name)
 
-
-def _deepcopy(data):
-    import copy  # noqa: PLC0415
-    return copy.deepcopy(data)
 
 
 COLLECTOR = Collector()

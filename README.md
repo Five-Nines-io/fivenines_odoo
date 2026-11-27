@@ -47,8 +47,10 @@ and paste the key, in each branch (production, staging, development) you want to
 
 The most specific value wins: Settings, then the config file, then the environment. A key in
 the config file or the environment ships with your deployment and enrolls every database that has
-the module installed (use "Pause monitoring" to exclude one). Odoo 19 prints one "unknown option"
-warning per `fivenines_*` option at startup: it is harmless, Odoo keeps the value.
+the module installed (use "Pause monitoring" to exclude one). A server-wide key always goes to
+the server-wide API URL (config file, environment or default), never to a URL set in one
+database's Settings. Odoo 19 prints one "unknown option" warning per `fivenines_*` option at
+startup: it is harmless, Odoo keeps the value.
 
 ## How it works
 
@@ -63,9 +65,12 @@ warning per `fivenines_*` option at startup: it is harmless, Odoo keeps the valu
   reached nothing is lost: the next push covers the longer window. Retries back off up to 15 min.
 - The enrollment key is exchanged once for a per-instance secret, stored in
   `ir.config_parameter` (administrators only). A fingerprint of where the database runs (name,
-  `database.uuid`, `web.base.url`, Odoo.sh stage) is checked on every run: a copied database
-  enrolls as a new instance instead of reporting as the original. Odoo's neutralization also
-  deletes the secret.
+  `database.uuid`, `web.base.url`, Odoo.sh stage) is checked on every run: a database copied under
+  another name or uuid enrolls as a new instance instead of reporting as the original. A
+  `web.base.url` change alone (Odoo rewrites it on admin logins) is reported to Fivenines, which
+  tells a second live copy apart. Odoo's neutralization also deletes the secret.
+- A refused secret (HTTP 401, e.g. revoked in Fivenines) stops the pushes; the module retries
+  once a day and never re-enrolls on its own. "Re-enroll" in Settings starts over.
 - Secrets travel only in the `Authorization` header, over HTTPS, and are never logged.
 
 ## Odoo.sh notes
@@ -83,6 +88,8 @@ warning per `fivenines_*` option at startup: it is harmless, Odoo keeps the valu
   workers' counters (the spool directory is local), and the cron runs on one of them at a time.
 - With `log_level = debug_sql` Odoo itself logs every SQL statement with its values, including
   the row that stores the secret. Do not run production at that level.
+- Error messages are sent as templates; messages formatted before logging are masked with
+  patterns (emails, URLs, numbers, quoted strings, ids), which cannot catch every shape of data.
 
 ## Development
 

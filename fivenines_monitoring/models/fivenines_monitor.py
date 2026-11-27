@@ -14,6 +14,7 @@ import platform
 import socket
 import threading
 import time
+import uuid
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -40,12 +41,15 @@ P_FINGERPRINT = 'fivenines.fingerprint'
 P_ENROLLED_AT = 'fivenines.enrolled_at'
 P_STATUS = 'fivenines.status'
 P_SERVER = 'fivenines.server_identity'
-STATE_PARAMS = (P_SECRET, P_INSTANCE, P_FINGERPRINT, P_ENROLLED_AT, P_STATUS, P_SERVER)
+P_COPIED_FROM = 'fivenines.copied_from'  # set by data/neutralize.sql
+STATE_PARAMS = (P_SECRET, P_INSTANCE, P_FINGERPRINT, P_ENROLLED_AT, P_STATUS, P_SERVER,
+                P_COPIED_FROM)
 
 LATE_THRESHOLD = 300    # a due cron not picked up for 5 min is late
 STUCK_THRESHOLD = 1800  # a cron still running 30 min after its due time is stuck
 MAX_CRON_ITEMS = 50
 HOLD_LONG = 3600        # 402 / 403: try again in an hour
+RETRY_REVOKED = 86400   # 401: try again once a day (heals a server-side mistake)
 WARN_EVERY = 900        # rate limit of our own warnings, per kind
 
 _last_warning = {}
@@ -94,12 +98,6 @@ def normalize_url(url):
     return '%s://%s%s' % (parts.scheme.lower(), host, parts.path.rstrip('/'))
 
 
-def _is_loopback_url(url):
-    if not url:
-        return True
-    return fn_client.is_loopback(urlsplit(url).hostname)
-
-
 def _testing():
     return bool(getattr(threading.current_thread(), 'testing', False)
                 or getattr(odoo.modules.module, 'current_test', None))
@@ -123,6 +121,11 @@ class FiveninesMonitor(models.AbstractModel):
     def _register_hook(self):
         super()._register_hook()
         try:
+            from odoo.service import server as odoo_server  # noqa: PLC0415
+            srv = getattr(odoo_server, 'server', None)
+            if type(srv).__name__ == 'PreforkServer' and getattr(srv, 'pid', None) == os.getpid():
+                # registry preloaded in the prefork master: never count there
+                COLLECTOR.ignore_pid = os.getpid()
             COLLECTOR.register_db(self.env.cr.dbname, self._fn_spool_dir())
             COLLECTOR.install(force_werkzeug_info=_conf_bool(
                 'fivenines_capture_quiet_werkzeug', 'FIVENINES_CAPTURE_QUIET_WERKZEUG', True))
@@ -184,9 +187,18 @@ class FiveninesMonitor(models.AbstractModel):
         return _conf('fivenines_enrollment_key', 'FIVENINES_ENROLLMENT_KEY')
 
     @api.model
-    def _fn_api_url(self, params=None):
+    def _fn_api_url(self, params=None, key_source=None):
+        """API base URL. A database setting never redirects a server-wide key.
+
+        When the enrollment key comes from odoo.conf or the environment, it is
+        shared by every database of the server: the URL then comes from the same
+        level (odoo.conf / environment / default), so a database administrator
+        cannot point it at another host and receive the organization key.
+        """
         params = params if params is not None else self._fn_params()
         url = (params.get(P_API_URL) or '').strip()
+        if key_source in ('odoo.conf', 'environment'):
+            url = ''
         if not url:
             url = _conf('fivenines_api_url', 'FIVENINES_API_URL')[0] or fn_client.DEFAULT_API_URL
         return fn_client.check_api_url(url, allow_insecure=_conf_bool(
@@ -301,7 +313,8 @@ class FiveninesMonitor(models.AbstractModel):
             doc = spool.read_json(path)
             if doc and isinstance(doc.get('stats'), dict):
                 acked[key] = doc['stats']
-        return {'acked': acked, 'last_ack_end': now, 'seq': 0, 'baseline_reset': True}
+        return {'acked': acked, 'last_ack_end': now, 'seq': 0, 'baseline_reset': True,
+                'stream': uuid.uuid4().hex}
 
     # ------------------------------------------------------------------
     # cron entry point
@@ -334,70 +347,89 @@ class FiveninesMonitor(models.AbstractModel):
     def _fn_run_locked(self, directory, state, trigger, force, reenroll=False):
         now = time.time()
         params = self._fn_params()
-        previous_instance = None
+        if (params.get(P_PAUSED) or '').lower() in ('true', '1'):
+            # checked first: a Re-enroll while paused must not forget anything
+            self._fn_sweep(directory, state)
+            return {'result': 'paused'}
         if reenroll:
             # Administrator asked for a new enrollment: forget the secret (and a
             # revoked / refused status). Our own copy of the params is updated
             # too: this transaction cannot see the committed write.
-            previous_instance = params.get(P_INSTANCE)
+            previous = params.get(P_INSTANCE)
             self._fn_forget(keep_status=False)
             params = dict(params, **{k: None for k in STATE_PARAMS})
             state.clear()
-        if (params.get(P_PAUSED) or '').lower() in ('true', '1'):
-            self._fn_sweep(directory, state)
-            return {'result': 'paused'}
-        if not force and state.get('next_attempt_at', 0) > now:
-            return {'result': 'backoff', 'next_attempt_at': state['next_attempt_at']}
-
-        try:
-            api_url = self._fn_api_url(params)
-        except ValueError as e:
-            return {'result': 'config_error', 'message': str(e)}
-        api_client = fn_client.Client(api_url, self._fn_user_agent())
+            state['pending_enroll'] = {'reason': 'manual', 'previous_instance_id': previous}
+        status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
+        revoked = status.get('state') == 'revoked'
 
         components, digest = self._fn_fingerprint()
         secret = params.get(P_SECRET)
-        enroll_reason = 'manual' if reenroll else 'first_enrollment'
-        fingerprint_change = None
         stored = json.loads(params[P_FINGERPRINT]) if params.get(P_FINGERPRINT) else None
         if stored and stored.get('hash') != digest:
             old = stored.get('components') or {}
             changed = sorted(k for k in components if components.get(k) != old.get(k))
-            if changed == ['base_url'] and _is_loopback_url(old.get('base_url')):
-                # localhost -> real URL (first admin login updates web.base.url):
-                # the same instance, not a copy. Adopt the new URL.
-                fingerprint_change = 'base_url_from_loopback'
+            if changed == ['base_url']:
+                # Odoo rewrites web.base.url on admin logins (unless
+                # web.base.url.freeze): a first login or an alias, not a copy.
+                # Adopt it, and flag it on every push until one is acknowledged;
+                # Fivenines tells a second live place apart (409, contract s5).
                 self._fn_store({P_FINGERPRINT: json.dumps({'hash': digest, 'components': components})})
+                state['fingerprint_change'] = 'base_url_changed'
             else:
+                # another database name, database.uuid or Odoo.sh stage: a copy
                 _logger.info('Fivenines: instance location changed (%s), enrolling as a new instance',
                              ', '.join(changed))
-                previous_instance = params.get(P_INSTANCE)
-                enroll_reason = 'fingerprint_changed'
+                previous = params.get(P_INSTANCE)
                 secret = None
+                revoked = False
                 self._fn_forget(keep_status=False)
                 params = dict(params, **{k: None for k in STATE_PARAMS})
                 state.clear()
+                state['pending_enroll'] = {'reason': 'fingerprint_changed',
+                                           'previous_instance_id': previous}
+
+        # after the fingerprint check: a copy must not wait for the original's backoff
+        if not force and state.get('next_attempt_at', 0) > now:
+            if revoked:
+                self._fn_sweep(directory, state)
+            return {'result': 'revoked' if revoked else 'backoff',
+                    'next_attempt_at': state['next_attempt_at']}
+
+        _key, key_source = self._fn_enrollment_key(params)
+        try:
+            api_url = self._fn_api_url(params, key_source)
+        except ValueError as e:
+            return {'result': 'config_error', 'message': str(e)}
+        api_client = fn_client.Client(api_url, self._fn_user_agent())
 
         if not secret:
-            status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
-            if status.get('state') == 'revoked':
-                # only "Re-enroll" (which clears this status) may resume
+            if revoked:  # a secret dropped by an older version on 401
+                self._fn_sweep(directory, state)
                 return {'result': 'revoked'}
+            # the reason survives a failed enrollment (state.json) until one succeeds
+            pending = state.get('pending_enroll') or {}
+            reason, previous = pending.get('reason'), pending.get('previous_instance_id')
+            if not reason and params.get(P_COPIED_FROM):
+                reason, previous = 'neutralized_copy', params[P_COPIED_FROM]
             outcome = self._fn_enroll(api_client, directory, state, params, components, digest,
-                                      enroll_reason, previous_instance, force)
+                                      reason or 'first_enrollment', previous, force)
             if outcome.get('result') != 'enrolled':
+                if outcome.get('result') in ('no_key', 'enrollment_refused'):
+                    self._fn_sweep(directory, state)
                 return outcome
             secret = outcome.pop('secret')
-            params = dict(params, **{P_INSTANCE: outcome['instance_id'], P_SERVER: None})
+            params = dict(params, **{P_INSTANCE: outcome['instance_id'], P_SERVER: None,
+                                     P_STATUS: None})
 
         if not state.get('acked') and 'last_ack_end' not in state:
             state.update(self._fn_fresh_baseline(directory, now))
 
         payload, commit = self._fn_build_payload(directory, state, params, components, digest, now)
-        payload['instance']['fingerprint_change'] = fingerprint_change
+        payload['instance']['fingerprint_change'] = state.get('fingerprint_change')
         result = api_client.push(secret, payload)
         return self._fn_handle_push(api_client, directory, state, params, components, digest,
-                                    payload, commit, result, now, trigger)
+                                    payload, commit, result, now)
 
     # ------------------------------------------------------------------
     # enrollment
@@ -435,6 +467,7 @@ class FiveninesMonitor(models.AbstractModel):
                 P_ENROLLED_AT: str(int(now)),
                 P_STATUS: False,
                 P_SERVER: False,
+                P_COPIED_FROM: False,
             })
             state.clear()
             state.update(self._fn_fresh_baseline(directory, now))
@@ -472,7 +505,7 @@ class FiveninesMonitor(models.AbstractModel):
     # ------------------------------------------------------------------
     @api.model
     def _fn_handle_push(self, api_client, directory, state, params, components, digest,
-                        payload, commit, result, now, trigger):
+                        payload, commit, result, now):
         base = {'status': result.status, 'seq': payload['seq']}
         if result.ok:
             state['acked'] = commit['acked']
@@ -483,6 +516,7 @@ class FiveninesMonitor(models.AbstractModel):
             state['baseline_reset'] = False
             state['system_prev'] = commit['system_prev']
             state.pop('next_attempt_at', None)
+            state.pop('fingerprint_change', None)
             state['last_success'] = {'at': now, 'summary': commit['summary']}
             for path in commit['delete']:
                 try:
@@ -490,23 +524,34 @@ class FiveninesMonitor(models.AbstractModel):
                 except OSError:
                     pass
             server = commit['server']
+            store = {}
             if server and params.get(P_SERVER) != json.dumps(server, sort_keys=True):
-                self._fn_store({P_SERVER: json.dumps(server, sort_keys=True)})
+                store[P_SERVER] = json.dumps(server, sort_keys=True)
+            if params.get(P_STATUS):  # e.g. a 401 that Fivenines no longer answers
+                store[P_STATUS] = False
+            if store:
+                self._fn_store(store)
             return dict(base, result='pushed', **commit['summary'])
         if result.kind == fn_client.UNAUTHORIZED:
-            # Revoked in Fivenines: stop. Re-enrolling on our own would undo the
-            # revocation, so only an administrator ("Re-enroll") can resume.
-            self._fn_store({P_SECRET: False, P_STATUS: json.dumps({
+            # Revoked in Fivenines: stop pushing. Never re-enroll on our own
+            # (that would undo the revocation). The secret is kept and tried
+            # again once a day, so a server-side mistake heals itself; a real
+            # revocation keeps answering 401. "Re-enroll" starts over at once.
+            self._fn_store({P_STATUS: json.dumps({
                 'state': 'revoked', 'at': int(now), 'message': result.message})})
-            _warn('push401', 'Fivenines: the instance secret was revoked (HTTP 401); pushes stopped. '
-                  'Use "Re-enroll" in the Fivenines settings to resume.')
+            state['next_attempt_at'] = now + RETRY_REVOKED - 5
+            state['last_error'] = {'at': now, 'kind': result.kind, 'status': result.status,
+                                   'message': result.message}
+            _warn('push401', 'Fivenines: the instance secret was refused (HTTP 401); pushes stopped, '
+                  'next try in 24 h. Use "Re-enroll" in the Fivenines settings to start over.')
             return dict(base, result='revoked', message=result.message)
-        if result.kind == fn_client.CONFLICT and trigger != 'conflict':
+        if result.kind == fn_client.CONFLICT:
             # The same secret is used from another place: we are a copy.
             _logger.info('Fivenines: fingerprint conflict (HTTP 409), enrolling as a new instance')
             previous = params.get(P_INSTANCE)
             self._fn_forget(keep_status=False)
             state.clear()
+            state['pending_enroll'] = {'reason': 'conflict', 'previous_instance_id': previous}
             fresh = dict(params, **{k: None for k in STATE_PARAMS})
             outcome = self._fn_enroll(api_client, directory, state, fresh, components, digest,
                                       'conflict', previous, True)
@@ -523,13 +568,14 @@ class FiveninesMonitor(models.AbstractModel):
 
     @api.model
     def _fn_sweep(self, directory, state):
-        """Delete files of dead processes (used while paused / not enrolled)."""
-        now = time.time()
+        """Delete files of dead processes while nothing is pushed (paused, no
+        key, key refused, revoked). Their counters would never be sent anyway."""
         acked = state.get('acked') or {}
         for key, path, pid, start in spool.list_process_files(directory):
             doc = spool.read_json(path) or {}
-            stale = now - doc.get('flushed_at', 0) > spool.STALE_AFTER
-            if stale or not spool.process_alive(pid, doc.get('started_at', start)):
+            # a live process keeps its file however long it has been idle: the
+            # flusher only rewrites a file when there is something new
+            if not spool.process_alive(pid, doc.get('started_at', start)):
                 try:
                     os.unlink(path)
                 except OSError:
@@ -547,6 +593,17 @@ class FiveninesMonitor(models.AbstractModel):
                 errors.append({'collector': name, 'type': type(e).__name__, 'message': str(e)[:200]})
                 return None
 
+        def guard_sql(name, fn):
+            # a savepoint, so a failed query (statement_timeout...) nulls its
+            # block instead of aborting the cron's transaction
+            def run():
+                with self.env.cr.savepoint():
+                    return fn()
+            return guard(name, run)
+
+        if not state.get('stream'):
+            state['stream'] = uuid.uuid4().hex
+
         # -- per-process counters -> deltas since the last acknowledged push
         COLLECTOR.flush(self.env.cr.dbname)
         acked = state.get('acked') or {}
@@ -563,7 +620,10 @@ class FiveninesMonitor(models.AbstractModel):
             stats.merge_into(agg, part)
             started_at = doc.get('started_at', start)
             alive = spool.process_alive(pid, started_at)
-            if alive and now - doc.get('flushed_at', 0) <= spool.STALE_AFTER:
+            # alive, however long idle: keep its baseline (the flusher only
+            # rewrites a file that has new data; dropping the baseline of an
+            # idle worker would resend its whole history on its next flush)
+            if alive:
                 new_acked[key] = current
                 workers.append({'pid': pid, 'started_at': round(started_at, 2),
                                 'last_flush_at': round(doc.get('flushed_at', 0), 3)})
@@ -606,6 +666,7 @@ class FiveninesMonitor(models.AbstractModel):
         payload = {
             'schema_version': SCHEMA_VERSION,
             'sent_at': round(now, 3),
+            'stream_id': state['stream'],
             'seq': (state.get('seq') or 0) + 1,
             'window': {
                 'start': round(start, 3),
@@ -620,8 +681,8 @@ class FiveninesMonitor(models.AbstractModel):
             'events': events,
             'http': http_block,
             'logs': stats.logs_payload(agg),
-            'crons': guard('crons', self._fn_collect_crons),
-            'database': guard('database', self._fn_collect_database),
+            'crons': guard_sql('crons', self._fn_collect_crons),
+            'database': guard_sql('database', self._fn_collect_database),
             'system': system_block,
             'collector_errors': errors,
         }
@@ -780,7 +841,7 @@ class FiveninesMonitor(models.AbstractModel):
     @api.model
     def _fn_status(self):
         params = self._fn_params()
-        key, source = self._fn_enrollment_key(params)
+        _key, source = self._fn_enrollment_key(params)
         try:
             state = self._fn_load_state(self._fn_spool_dir())
         except Exception:  # noqa: BLE001

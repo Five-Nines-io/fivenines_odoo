@@ -1,18 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Part of Fivenines Monitoring. License LGPL-3. -->
 <odoo>
-    <!-- Only fields that exist in Odoo 16 to 19. numbercall / doall (16, 17 only)
-         are set by _setup_cron below. -->
-    <record id="ir_cron_fivenines_push" model="ir.cron">
-        <field name="name">Fivenines: push metrics</field>
-        <field name="model_id" ref="model_fivenines_monitor"/>
-        <field name="state">code</field>
-        <field name="code">model._cron_push()</field>
-        <field name="user_id" ref="base.user_root"/>
-        <field name="interval_number">1</field>
-        <field name="interval_type">minutes</field>
-        <field name="priority">1</field>
-        <field name="active" eval="True"/>
-    </record>
+    <!-- noupdate: a module upgrade must not re-activate a cron that Odoo's
+         neutralization or an administrator deactivated. Only fields that exist
+         in Odoo 16 to 19; numbercall / doall (16, 17) are set by _setup_cron. -->
+    <data noupdate="1">
+        <record id="ir_cron_fivenines_push" model="ir.cron">
+            <field name="name">Fivenines: push metrics</field>
+            <field name="model_id" ref="model_fivenines_monitor"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_push()</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="interval_number">1</field>
+            <field name="interval_type">minutes</field>
+            <field name="priority">1</field>
+            <field name="active" eval="True"/>
+        </record>
+    </data>
+    <!-- outside noupdate: runs on every install and upgrade -->
     <function model="fivenines.monitor" name="_setup_cron"/>
 </odoo>

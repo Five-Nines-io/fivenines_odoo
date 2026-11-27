@@ -16,8 +16,10 @@ import requests
 
 from odoo import fields, release
 from odoo.exceptions import AccessError
+from odoo.tools import mute_logger
 from odoo.tests.common import HttpCase, TransactionCase, tagged
 
+from ..lib import client as fn_client
 from ..lib import spool, stats
 from ..lib.collector import COLLECTOR
 from ..models import fivenines_monitor as fm
@@ -69,6 +71,9 @@ class FiveninesCase:
         old = COLLECTOR.dbs.get(dbname)
         COLLECTOR.dbs[dbname] = self.spool_dir
         self.addCleanup(lambda: COLLECTOR.dbs.__setitem__(dbname, old) if old else COLLECTOR.dbs.pop(dbname, None))
+        warnings = patch.dict(fm._last_warning, clear=True)  # _warn rate limit
+        warnings.start()
+        self.addCleanup(warnings.stop)
         self.icp = self.env['ir.config_parameter'].sudo()
         for k in fm.STATE_PARAMS + (fm.P_KEY, fm.P_PAUSED, fm.P_API_URL):
             self.icp.set_param(k, False)
@@ -165,19 +170,48 @@ class TestEnrollAndPush(FiveninesCase, TransactionCase):
 
     def test_key_from_environment(self):
         self.icp.set_param(fm.P_KEY, False)
-        with patch.dict(os.environ, {'FIVENINES_ENROLLMENT_KEY': self.key}), \
-                patch.object(fm, '_conf', side_effect=lambda name, env: (
-                    (os.environ.get(env), 'environment') if os.environ.get(env) else (None, None))):
+        env_conf = patch.object(fm, '_conf', side_effect=lambda name, env: (
+            (os.environ.get(env), 'environment') if os.environ.get(env) else (None, None)))
+        with patch.dict(os.environ, {'FIVENINES_ENROLLMENT_KEY': self.key,
+                                     'FIVENINES_API_URL': self.stub.url}), env_conf:
             self.assertEqual(self.monitor._fn_enrollment_key({fm.P_KEY: None}), (self.key, 'environment'))
             out = self.run_push()
         self.assertEqual(out['result'], 'pushed', out)
+
+    def test_server_wide_key_ignores_database_url(self):
+        # Value: protects=a key from odoo.conf/env is never sent to a URL set in one database's settings; fails_when=the db-level api_url wins over the server-wide key's level; why_new=red-team RT3 (tenant admin could receive the org key); seam=none; no_claim=odoo.conf parsing (_conf patched)
+        self.icp.set_param(fm.P_KEY, False)
+        self.icp.set_param(fm.P_API_URL, 'https://attacker.example.com')
+        env_conf = patch.object(fm, '_conf', side_effect=lambda name, env: (
+            (os.environ.get(env), 'environment') if os.environ.get(env) else (None, None)))
+        with patch.dict(os.environ, {'FIVENINES_ENROLLMENT_KEY': self.key,
+                                     'FIVENINES_API_URL': self.stub.url}), env_conf:
+            self.assertEqual(self.monitor._fn_api_url(self.monitor._fn_params(), 'environment'),
+                             self.stub.url)
+            self.assertEqual(self.run_push()['result'], 'pushed')
+        # a key pasted in the database's own settings may use its own URL
+        self.assertEqual(self.monitor._fn_api_url({fm.P_API_URL: 'https://own.example.com'}, 'settings'),
+                         'https://own.example.com')
         # the settings value, when present, wins over the deployment config
         self.assertEqual(self.monitor._fn_enrollment_key({fm.P_KEY: 'abc'}), ('abc', 'settings'))
 
+    def test_no_key_sweeps_dead_spool_files(self):
+        # Value: protects=without a key (nothing pushed) dead process files are removed; fails_when=the sweep runs only while paused, /tmp grows forever; why_new=core review finding, only the paused path was tested; seam=none; no_claim=revoked and refused paths (same helper)
+        self.icp.set_param(fm.P_KEY, False)
+        dead = self.fake_process_file(2 ** 22 + 9, 1.0, requests_2xx=1)
+        with patch.object(fm, '_conf', return_value=(None, None)):
+            self.assertEqual(self.run_push()['result'], 'no_key')
+        self.assertFalse(os.path.exists(dead))
+
     def test_paused(self):
         self.icp.set_param(fm.P_PAUSED, True)
+        # Value: protects=paused run deletes spool files of dead processes, keeps live ones; fails_when=_fn_sweep dropped/inverted, spool grows forever; why_new=sweep untested; seam=none; no_claim=stale-by-age path
+        dead = self.fake_process_file(2 ** 22 + 7, 1.0, requests_2xx=1)
+        live = self.fake_process_file(os.getpid(), COLLECTOR.started_at, requests_2xx=1)
         self.assertEqual(self.run_push()['result'], 'paused')
         self.assertEqual(self.stub.state.requests, [])
+        self.assertFalse(os.path.exists(dead))
+        self.assertTrue(os.path.exists(live))
 
     def test_secret_never_logged_nor_sent_in_body(self):
         capture = _LogCapture()
@@ -223,14 +257,18 @@ class TestErrors(FiveninesCase, TransactionCase):
         self.run_push()
         first = self.icp.get_param(fm.P_INSTANCE)
         requests.post(self.stub.url + '/_stub/revoke', json={'instance_id': first}, timeout=5)
+        secret = self.icp.get_param(fm.P_SECRET)
         out = self.run_push()
         self.assertEqual(out['result'], 'revoked')
-        self.assertFalse(self.icp.get_param(fm.P_SECRET))
+        self.assertEqual(self.icp.get_param(fm.P_SECRET), secret, 'kept for the daily retry')
+        self.assertGreater(self.state_file()['next_attempt_at'], time.time() + 86000)
         n = len(self.stub.state.requests)
-        # the cron does not re-enroll on its own, even when forced ("Send now")
+        # the cron neither pushes nor re-enrolls before the daily retry
         self.assertEqual(self.run_push()['result'], 'revoked')
-        self.assertEqual(self.run_push(force=True)['result'], 'revoked')
         self.assertEqual(len(self.stub.state.requests), n)
+        # "Send now" pushes once more (still refused), but never re-enrolls
+        self.assertEqual(self.run_push(force=True)['result'], 'revoked')
+        self.assertEqual(self.stub_requests('enroll')[-1:], self.stub_requests('enroll')[:1])
         # an administrator re-enrolls explicitly
         out = self.run_push(trigger='manual', force=True, reenroll=True)
         self.assertEqual(out['result'], 'pushed', out)
@@ -239,6 +277,41 @@ class TestErrors(FiveninesCase, TransactionCase):
         record = self.stub.state.instances[second]
         self.assertEqual(record['reason'], 'manual')
         self.assertEqual(record['previous_instance_id'], first)
+
+    def test_401_heals_when_fivenines_accepts_again(self):
+        # Value: protects=a 401 caused by a server-side mistake heals at the daily retry on the same instance; fails_when=401 drops the secret so the whole fleet needs manual re-enroll; why_new=red-team RT9, decision D5; seam=none; no_claim=real 24 h wait (state.json edited)
+        self.run_push()
+        first = self.icp.get_param(fm.P_INSTANCE)
+        with self.stub.state.lock:
+            self.stub.state.instances[first]['revoked'] = True
+        self.assertEqual(self.run_push()['result'], 'revoked')
+        with self.stub.state.lock:
+            self.stub.state.instances[first]['revoked'] = False
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'pushed')
+        self.assertEqual(self.icp.get_param(fm.P_INSTANCE), first)
+        self.assertFalse(self.icp.get_param(fm.P_STATUS))
+
+    def test_reenroll_while_paused_forgets_nothing(self):
+        # Value: protects=Re-enroll while paused keeps the secret and instance; fails_when=the reenroll branch runs before the pause check; why_new=state-machine finding SM2; seam=none; no_claim=UI button path (model call)
+        self.run_push()
+        first = self.icp.get_param(fm.P_INSTANCE)
+        self.icp.set_param(fm.P_PAUSED, True)
+        self.assertEqual(self.run_push(trigger='manual', force=True, reenroll=True)['result'], 'paused')
+        self.assertEqual(self.icp.get_param(fm.P_INSTANCE), first)
+        self.assertTrue(self.icp.get_param(fm.P_SECRET))
+
+    def test_failed_reenroll_keeps_reason_and_previous(self):
+        # Value: protects=after a failed enrollment for a copy the retry still says fingerprint_changed with previous_instance_id; fails_when=the reason is lost and the retry looks like a dedupable first_enrollment; why_new=state-machine finding SM3; seam=none; no_claim=409/manual paths (same pending_enroll)
+        self.run_push()
+        first = self.icp.get_param(fm.P_INSTANCE)
+        self.icp.set_param('database.uuid', 'copied-%s' % secrets.token_hex(4))
+        self.fail_next(503, path='enroll')
+        self.assertEqual(self.run_push()['result'], 'enroll_failed')
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'pushed')
+        record = self.stub.state.instances[self.icp.get_param(fm.P_INSTANCE)]
+        self.assertEqual((record['reason'], record['previous_instance_id']), ('fingerprint_changed', first))
 
     def test_401_on_enroll_waits_for_a_new_key(self):
         self.icp.set_param(fm.P_KEY, 'f' * 64)
@@ -291,6 +364,35 @@ class TestErrors(FiveninesCase, TransactionCase):
         out = self.run_push()
         self.assertEqual(self.last_payload()['http']['requests_by_status']['2xx'], 0, 'counted once')
 
+    def test_stream_id_changes_with_a_baseline_reset(self):
+        # Value: protects=seq restarts only together with a new stream_id, so (stream_id, seq) dedup never drops data; fails_when=seq restarts at 1 with the same stream after state.json is lost; why_new=red-team RT5; seam=none; no_claim=server dedup itself
+        self.run_push()
+        self.run_push()
+        stream = self.last_payload()['stream_id']
+        self.assertEqual(self.last_payload()['seq'], 2)
+        os.unlink(os.path.join(self.spool_dir, spool.STATE_FILE))  # reboot wiped /tmp
+        self.run_push()
+        p = self.last_payload()
+        self.assertEqual(p['seq'], 1)
+        self.assertTrue(p['window']['baseline_reset'])
+        self.assertNotEqual(p['stream_id'], stream)
+
+    def test_failing_sql_collector_does_not_abort_the_run(self):
+        # Value: protects=a failing SQL collector nulls its block, the transaction stays usable and the push goes out; fails_when=guard catches the SQL error without a savepoint (InFailedSqlTransaction later); why_new=red-team RT11; seam=none; no_claim=statement_timeout itself (a bad query stands in)
+        self.run_push()
+
+        def broken(self_):
+            self_.env.cr.execute('SELECT no_such_column FROM ir_cron')
+
+        # odoo.sql_db logs the bad query at ERROR: expected here, muted
+        with patch.object(self.registry['fivenines.monitor'], '_fn_collect_crons', broken), \
+                mute_logger('odoo.sql_db'):
+            self.assertEqual(self.run_push()['result'], 'pushed')
+        p = self.last_payload()
+        self.assertIsNone(p['crons'])
+        self.assertEqual([e['collector'] for e in p['collector_errors']], ['crons'])
+        self.assertIsNotNone(p['database'], 'later queries still run')
+
     def test_timeout_is_retryable(self):
         self.run_push()
         with patch.object(requests, 'post', side_effect=requests.exceptions.ReadTimeout('slow')):
@@ -340,12 +442,33 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(record['reason'], 'fingerprint_changed')
         self.assertEqual(record['previous_instance_id'], first)
 
-    def test_new_public_url_reenrolls(self):
+    def test_new_public_url_is_adopted_until_acked(self):
+        # Value: protects=a base_url-only change (admin login via an alias) keeps the instance and is flagged until a push is acked; fails_when=a URL change re-enrolls, or a failed push loses the flag and the 409 rule splits the instance; why_new=red-team RT2 + state-machine SM1, decision D3; seam=none; no_claim=real admin login (param set directly)
         self.run_push()
         first = self.icp.get_param(fm.P_INSTANCE)
-        self.icp.set_param('web.base.url', 'https://staging.example.com')
+        self.icp.set_param('web.base.url', 'https://alias.example.com')
+        self.fail_next(503)
+        self.assertEqual(self.run_push()['result'], 'push_failed')
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'pushed')
+        self.assertEqual(self.icp.get_param(fm.P_INSTANCE), first)
+        self.assertEqual(self.last_payload()['instance']['fingerprint_change'], 'base_url_changed')
         self.run_push()
-        self.assertNotEqual(first, self.icp.get_param(fm.P_INSTANCE))
+        self.assertIsNone(self.last_payload()['instance']['fingerprint_change'])
+        self.assertEqual(len(self.stub_requests('enroll')), 1)
+
+    def test_stub_409_rule(self):
+        # Value: protects=the reference server answers 409 to a changed fingerprint from another running server while the old place is live, and adopts it from the same server; fails_when=the contract's s5 rule is not implemented as documented; why_new=decision D3 moved copy detection of URL changes to the server; seam=none; no_claim=the real fivenines-server
+        self.run_push()
+        secret = self.icp.get_param(fm.P_SECRET)
+        payload = json.loads(json.dumps(self.last_payload()))
+        payload['instance']['fingerprint'] = 'f' * 64
+        payload['process']['pid'] = payload['process']['pid'] + 1  # another server
+        r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
+        self.assertEqual(r.status, 409)
+        payload['process']['pid'] = self.last_payload()['process']['pid']  # same server
+        r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
+        self.assertEqual(r.status, 200)
 
     def test_url_change_from_localhost_is_adopted(self):
         self.icp.set_param('web.base.url', 'http://localhost:8069')
@@ -356,7 +479,7 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(out['result'], 'pushed', out)
         self.assertEqual(first, self.icp.get_param(fm.P_INSTANCE))
         payload = self.last_payload()
-        self.assertEqual(payload['instance']['fingerprint_change'], 'base_url_from_loopback')
+        self.assertEqual(payload['instance']['fingerprint_change'], 'base_url_changed')
         self.assertEqual(payload['instance']['base_url'], 'https://erp.example.com')
         self.assertEqual(len(self.stub_requests('enroll')), 1)
 
@@ -366,6 +489,7 @@ class TestFingerprint(FiveninesCase, TransactionCase):
                       json={'instance_id': self.icp.get_param(fm.P_INSTANCE)})
         self.assertEqual(self.run_push()['result'], 'revoked')
         self.icp.set_param('database.uuid', 'copy-of-revoked')
+        # no wait for the original's daily retry: the copy is detected first
         self.assertEqual(self.run_push()['result'], 'pushed')
 
     def test_neutralization_drops_the_secret(self):
@@ -379,8 +503,11 @@ class TestFingerprint(FiveninesCase, TransactionCase):
             row = self.env.cr.fetchone()
             return row and row[0]
 
-        self.assertFalse(raw(fm.P_SECRET))
-        self.assertFalse(raw(fm.P_INSTANCE))
+        first = self.stub.state.pushes[-1]['instance_id']
+        for key in fm.STATE_PARAMS:
+            if key != fm.P_COPIED_FROM:
+                self.assertFalse(raw(key), key)
+        self.assertEqual(raw(fm.P_COPIED_FROM), first)
         self.assertEqual(raw(fm.P_KEY), self.key)
         cron = self.env.ref('fivenines_monitoring.ir_cron_fivenines_push')
         self.env.cr.execute('SELECT active FROM ir_cron WHERE id = %s', [cron.id])
@@ -393,14 +520,42 @@ class TestFingerprint(FiveninesCase, TransactionCase):
                     pass
         else:
             self.env.registry.clear_caches()
-        # re-activated by an administrator, the copy enrolls as a new instance
+        # re-activated by an administrator, the copy enrolls as a new instance,
+        # linked to the original and with a reason the server never dedups
         self.assertEqual(self.run_push()['result'], 'pushed')
         self.assertEqual(len(self.stub_requests('enroll')), 2)
+        record = self.stub.state.instances[self.icp.get_param(fm.P_INSTANCE)]
+        self.assertEqual((record['reason'], record['previous_instance_id']), ('neutralized_copy', first))
+        self.assertFalse(raw(fm.P_COPIED_FROM))
 
     def test_normalize_url(self):
         self.assertEqual(fm.normalize_url('HTTPS://Erp.Example.com:443/'), 'https://erp.example.com')
         self.assertEqual(fm.normalize_url('http://h:8069/odoo/'), 'http://h:8069/odoo')
         self.assertIsNone(fm.normalize_url(''))
+
+
+@tagged('post_install', '-at_install', 'fivenines')
+class TestCounting(FiveninesCase, TransactionCase):
+
+    def test_idle_live_worker_counted_once(self):
+        # Value: protects=a live process idle for over an hour keeps its acked baseline, each request counted once; fails_when=a stale-by-age rule drops the baseline of a live process and its history is resent; why_new=QA ISSUE-001 (red-team RT1) reproduced it, no test covered an old file of a live pid; seam=none; no_claim=real prefork worker (a sleep process stands in)
+        # Regression proof - fails at HEAD: yes (6 != 1) · passes at base: unavailable (ecosystem) · passes after fix: yes
+        import psutil
+        self.run_push()
+        child = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        started = psutil.Process(child.pid).create_time()
+        path = self.fake_process_file(child.pid, started, requests_2xx=5)
+        doc = spool.read_json(path)
+        doc['flushed_at'] = time.time() - 4000  # idle for over an hour
+        spool.write_json_atomic(path, doc)
+        self.run_push(force=True)
+        self.assertEqual(self.last_payload()['http']['requests_by_status']['2xx'], 5)
+        self.fake_process_file(child.pid, started, requests_2xx=6)  # next flush: cumulative
+        self.run_push(force=True)
+        self.assertEqual(self.last_payload()['http']['requests_by_status']['2xx'], 1)
+        self.assertEqual(self.last_payload()['events'], [], 'a live idle worker never "exits"')
 
 
 @tagged('post_install', '-at_install', 'fivenines')
@@ -473,6 +628,49 @@ class TestCrons(FiveninesCase, TransactionCase):
         block = self.monitor._fn_collect_crons()
         self.assertNotIn(own.id, [j['id'] for j in block['jobs']])
 
+    def test_setup_cron_runs_forever(self):
+        # Value: protects=_setup_cron (run by ir_cron.xml on every install/upgrade) restores numbercall=-1, doall=False on Odoo 16/17; fails_when=_setup_cron gutted or field check inverted, cron runs once; why_new=test_own_cron_excluded_and_repeating checks the installed state only; seam=none; no_claim=Odoo 18+ (no such fields: only active is asserted)
+        cron = self.env.ref('fivenines_monitoring.ir_cron_fivenines_push')
+        broken = {k: v for k, v in (('numbercall', 1), ('doall', True)) if k in cron._fields}
+        if broken:
+            cron.write(broken)  # the defaults a plain XML record gets on 16/17
+        self.monitor._setup_cron()
+        self.assertTrue(cron.active)
+        if 'numbercall' in cron._fields:
+            self.assertEqual(cron.numbercall, -1)
+        if 'doall' in cron._fields:
+            self.assertFalse(cron.doall)
+
+    def test_cron_record_is_noupdate(self):
+        # Value: protects=a module upgrade does not re-activate a cron deactivated by neutralization or an admin; fails_when=the cron record is not in a noupdate block; why_new=red-team RT8; seam=none; no_claim=a real -u upgrade
+        data = self.env['ir.model.data'].sudo().search(
+            [('module', '=', 'fivenines_monitoring'), ('name', '=', 'ir_cron_fivenines_push')])
+        self.assertTrue(data.noupdate)
+
+    def test_running_stuck_and_unknown_crons(self):
+        # Value: protects=locked overdue jobs are running/stuck by lateness, and a failed lock probe gives null counts; fails_when=state thresholds or the None branch break; why_new=testing finding T5 (only late was tested); seam=none; no_claim=a real running cron (probe patched)
+        Cron = self.env['ir.cron'].sudo()
+
+        def job(name, minutes_late):
+            return Cron.create({
+                'name': name, 'model_id': self.env.ref('base.model_res_partner').id,
+                'state': 'code', 'code': 'pass', 'interval_number': 1, 'interval_type': 'days',
+                'nextcall': fields.Datetime.now() - timedelta(minutes=minutes_late)})
+
+        running, stuck = job('fivenines test running', 10), job('fivenines test stuck', 40)
+        M = self.registry['fivenines.monitor']
+        with patch.object(M, '_fn_locked_crons', return_value={running.id, stuck.id}):
+            b = self.monitor._fn_collect_crons()
+        states = {j['id']: j['state'] for j in b['jobs']}
+        self.assertEqual((states[running.id], states[stuck.id]), ('running', 'stuck'))
+        self.assertGreaterEqual(b['running_count'], 2)
+        self.assertGreaterEqual(b['stuck_count'], 1)
+        with patch.object(M, '_fn_locked_crons', return_value=None):
+            b = self.monitor._fn_collect_crons()
+        self.assertIsNone(b['late_count'])
+        self.assertIsNone(b['running_count'])
+        self.assertGreaterEqual(b['overdue_count'], 2)
+
     def test_database_block(self):
         block = self.monitor._fn_collect_database()
         self.assertGreater(block['size_bytes'], 0)
@@ -501,6 +699,17 @@ class TestSettings(FiveninesCase, TransactionCase):
         action = fresh.action_fivenines_reenroll()
         self.assertEqual(action['params']['type'], 'success', action)
         self.assertEqual(len(self.stub_requests('enroll')), 2)
+
+    def test_notifications_for_local_and_conflict_outcomes(self):
+        # Value: protects=Send now reports local errors and a successful conflict re-enroll as such, and never echoes server text; fails_when=every unknown outcome reads as a red 'Fivenines answered'; why_new=maintainability finding M1 + decision D4; seam=none; no_claim=web client rendering
+        S = self.env['res.config.settings']
+        a = S._fivenines_notify({'result': 'conflict', 'status': 409, 'enroll': 'enrolled'})
+        self.assertEqual(a['params']['type'], 'success')
+        a = S._fivenines_notify({'result': 'config_error', 'message': 'the Fivenines API URL must use https'})
+        self.assertNotIn('Fivenines answered', a['params']['message'])
+        a = S._fivenines_notify({'result': 'push_failed', 'status': 503, 'kind': 'retry',
+                                 'message': '<script>evil</script>'})
+        self.assertNotIn('evil', a['params']['message'])
 
     def test_non_admin_cannot_push(self):
         user = self.env['res.users'].create({

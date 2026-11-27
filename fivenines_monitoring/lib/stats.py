@@ -8,6 +8,7 @@ simply covers a longer window. This module is pure Python (no Odoo import) so
 it can be unit tested anywhere.
 """
 
+import bisect
 import copy
 
 # Upper bounds (milliseconds) of the latency histogram buckets. The last bucket
@@ -52,10 +53,8 @@ def status_class(code):
 
 
 def bucket_index(ms):
-    for i, bound in enumerate(LATENCY_BOUNDS_MS):
-        if ms <= bound:
-            return i
-    return len(LATENCY_BOUNDS_MS)
+    """Index of the first bucket whose upper bound is >= ms (last = overflow)."""
+    return bisect.bisect_left(LATENCY_BOUNDS_MS, ms)
 
 
 def record_request(stats, code, total_ms, sql_queries, sql_time_ms):
@@ -85,10 +84,6 @@ def record_log(stats, level, fingerprint, info):
         entry = dict(info, count=0)
         fps[fingerprint] = entry
     entry['count'] += 1
-
-
-def _sub_num(a, b):
-    return a - b
 
 
 def delta(current, baseline):
