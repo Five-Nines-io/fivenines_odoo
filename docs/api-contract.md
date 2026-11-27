@@ -21,7 +21,9 @@ When this document and a schema disagree, the schema wins. Fix both in the same 
   back a secret (`token`) that belongs to that instance only. From then on only the secret is
   used. **The key is used once and never kept in the database:** a key pasted in Settings is
   deleted as soon as the enrollment succeeds (a key in the Odoo config file or the environment
-  stays where the operator put it). This mirrors how the agent works today (`ApiController#authenticate_host!` and
+  stays where the operator put it). A key pasted later is kept only while the database needs
+  one (revoked, ignored, a copy that needs a key) and until it is used; otherwise the next run
+  deletes it. This mirrors how the agent works today (`ApiController#authenticate_host!` and
   `#enroll_host_via_token`): an `EnrollmentToken` (`SecureRandom.hex(32)`, revocable,
   `hosts_registered_count`, `last_used_at`) is swapped for a per-host `client_token`. The
   difference is that the Odoo module has a dedicated enrollment call instead of the agent's
@@ -180,7 +182,10 @@ enrollment (the issue's install flow, step 4), or attach the existing monitors w
   sent to the URL of the key's own level (section 2), never to the endpoint that issued the
   refused secret. Without a key it records `copy_needs_key` and makes no request until a key is
   configured or "Send now" is clicked.
-- Both states show on the settings screen with the `name` the server returned.
+- Pending and ignored show on the settings screen with the `name` the server returned.
+- The holds above (ignored, `copy_needs_key`) are recorded with the copy they apply to (its
+  database name, uuid, stage and neutralized flag, not `base_url`): an admin login that rewrites
+  `web.base.url` on an ignored copy keeps it silent.
 
 Server notes:
 
@@ -196,7 +201,8 @@ Server notes:
   copy of that instance, in the same organization: create a NEW instance with a new token,
   `previous_instance_id` = the secret's instance, state `pending`, and answer 202. The original
   instance and its token are untouched. If the same copy (copy of the same instance, same
-  fingerprint) already exists, answer that one: an ignored copy stays ignored (410), a pending one
+  database name, uuid, stage and neutralized flag; `base_url` aside, an admin login rewrites it)
+  already exists, answer that one: an ignored copy stays ignored (410), a pending one
   gets its token back.
 - With the enrollment key, whether a new database starts `monitored` (201) or `pending` (202) is
   the organization's policy.

@@ -141,6 +141,14 @@ class StubState:
             }
 
 
+COPY_COMPONENTS = ('database', 'database_uuid', 'odoo_stage', 'neutralized')
+
+
+def _copy_components(components):
+    components = components or {}
+    return tuple(components.get(k) or None for k in COPY_COMPONENTS)
+
+
 def _bearer(headers):
     value = headers.get('Authorization') or ''
     parts = value.split()
@@ -350,8 +358,12 @@ class Handler(BaseHTTPRequestHandler):
                     # a copy of a known database (same organization): proposed,
                     # never pushed as the original. Ignore is final for that
                     # copy: the same copy announcing itself again stays ignored.
+                    # "the same copy": same copy components (not base_url, which an
+                    # admin login rewrites), like the module's hold (contract s3)
+                    mine = _copy_components(body['instance'].get('fingerprint_components'))
                     for other in st.instances.values():
-                        if other.get('copy_of') == known['instance_id'] and other['fingerprint'] == fingerprint:
+                        if (other.get('copy_of') == known['instance_id']
+                                and _copy_components(other.get('fingerprint_components')) == mine):
                             inst, created = other, False
                             break
                     else:

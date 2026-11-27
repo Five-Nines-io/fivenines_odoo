@@ -575,6 +575,9 @@ class TestFingerprint(FiveninesCase, TransactionCase):
             self.expire_backoff()
             self.assertEqual(self.run_push()['result'], 'no_key')
         self.assertEqual(len(self.stub.state.requests), n, 'no request while it needs a key')
+        fm.icp_set(self.icp, 'web.base.url', 'https://staging.example.com')  # admin login
+        self.assertEqual(self.run_push()['result'], 'no_key')
+        self.assertEqual(len(self.stub.state.requests), n, 'still the same copy')
         fm.icp_set(self.icp, fm.P_KEY, self.key)
         self.assertEqual(self.run_push()['result'], 'pushed')
         record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
@@ -612,6 +615,28 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(fm.icp_get(self.icp, fm.P_KEY), self.key, 'kept for Re-enroll')
         self.assertEqual(self.run_push(trigger='manual', force=True, reenroll=True)['result'], 'pushed')
         self.assertIsNone(fm.icp_get(self.icp, fm.P_KEY), 'used once')
+
+    def test_key_is_dropped_when_the_database_does_not_need_one(self):
+        # Value: protects=the organization key is never kept on a database that does not need it (pasted on a healthy enrolled database, or left by an enrollment that rolled back); fails_when=a pasted key stays in ir.config_parameter and travels with every dump; why_new=review pass 2 (security, testing); seam=enrolled_at moved (one test transaction); no_claim=a real rollback
+        self.run_push()
+        fm.icp_set(self.icp, fm.P_ENROLLED_AT, str(int(time.time()) - 2 * 86400))
+        fm.icp_set(self.icp, fm.P_KEY, self.key)  # pasted on a healthy database
+        self.assertEqual(self.run_push()['result'], 'pushed')
+        self.assertIsNone(fm.icp_get(self.icp, fm.P_KEY))
+        # revoked, with the key the enrollment used still there (its deletion rolled back)
+        requests.post(self.stub.url + '/_stub/revoke', timeout=5,
+                      json={'instance_id': fm.icp_get(self.icp, fm.P_INSTANCE)})
+        self.assertEqual(self.run_push()['result'], 'revoked')
+        fm.icp_set(self.icp, fm.P_KEY, self.key)
+        fm.icp_set(self.icp, fm.P_ENROLLED_AT, str(int(time.time()) + 60))  # the key predates it
+        self.assertEqual(self.run_push(trigger='manual', force=True)['result'], 'revoked')
+        self.assertIsNone(fm.icp_get(self.icp, fm.P_KEY))
+
+    def test_server_name_is_bounded(self):
+        self.assertEqual(len(fm._server_name({'name': 'x' * 500})), fm.MAX_SERVER_NAME)
+        self.assertIsNone(fm._server_name(None))
+        self.assertIsNone(fm._server_name('not a dict'))
+        self.assertIsNone(fm._server_name({}))
 
     def test_neutralized_copy_stays_silent_until_turned_on(self):
         # Value: protects=Odoo's neutralization is respected (the cron stays off, the secret is kept) and one click turns monitoring on, after which the copy announces itself with the copied secret and lands as proposed; fails_when=neutralize deletes the secret, or the module re-activates its cron by itself; why_new=#7 (founder decision); seam=none; no_claim=Odoo.sh's own staging build
@@ -742,9 +767,26 @@ class TestApproval(FiveninesCase, TransactionCase):
             self.expire_backoff()
             self.assertEqual(self.run_push()['result'], 'ignored')
         self.assertEqual(len(self.stub.state.requests), n, 'an ignored copy makes no request')
+        # an admin login on the copy rewrites web.base.url: still the same copy
+        fm.icp_set(self.icp, 'web.base.url', 'https://staging.example.com')
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'ignored')
+        self.assertEqual(len(self.stub.state.requests), n, 'a base_url change does not re-announce it')
         # Send now still asks
         self.assertEqual(self.run_push(force=True)['result'], 'ignored')
         self.assertEqual(len(self.stub.state.requests), n + 1)
+
+    def test_copy_of_an_ignored_original_still_announces_itself(self):
+        # Value: protects=Ignore holds the database it was given for, not its later copies: a copy of an ignored database announces itself and is proposed; fails_when=the hold ignores which copy it was recorded for; why_new=review pass 2 (testing, state-machines); seam=none; no_claim=server policy for copies of ignored databases
+        self.run_push()
+        requests.post(self.stub.url + '/_stub/ignore', json={'instance_id': fm.icp_get(self.icp, fm.P_INSTANCE)},
+                      timeout=5)
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'ignored')
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        n = len(self.stub_requests('enroll'))
+        self.assertEqual(self.run_push()['result'], 'pending')
+        self.assertEqual(len(self.stub_requests('enroll')), n + 1)
 
 
 @tagged('post_install', '-at_install', 'fivenines')

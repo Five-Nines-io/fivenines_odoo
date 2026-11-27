@@ -48,6 +48,7 @@ STATE_PARAMS = (P_SECRET, P_INSTANCE, P_FINGERPRINT, P_ENROLLED_AT, P_STATUS, P_
                 P_ENDPOINT)
 # a component change that means "another database" (a copy). base_url alone
 # does not: Odoo rewrites it on admin logins.
+KEY_NEEDED_STATES = ('revoked', 'ignored', 'copy_needs_key')
 COPY_COMPONENTS = ('database', 'database_uuid', 'odoo_stage', 'neutralized')
 MAX_URLS = 50
 
@@ -121,6 +122,12 @@ def urls_from(base_url, domains):
 
 
 MAX_SERVER_NAME = 120
+
+
+def copy_key(components):
+    """Identity of a copy: its copy components only (not base_url)."""
+    picked = {k: components.get(k) or None for k in COPY_COMPONENTS}
+    return hashlib.sha256(json.dumps(picked, sort_keys=True).encode()).hexdigest()
 
 
 def _server_name(data):
@@ -503,9 +510,10 @@ class FiveninesMonitor(models.AbstractModel):
                 # no change that matters (a new component, base_url): adopt
                 self._fn_store({P_FINGERPRINT: json.dumps({'hash': digest, 'components': components})})
 
-        # a status recorded for a copy holds that copy (same digest), not a
+        # a status recorded for a copy holds that copy (same copy components:
+        # a base_url change from an admin login is still the same copy), not a
         # later copy of it: a copy of an ignored database still announces itself
-        held_here = not copy_of or status.get('fingerprint') == digest
+        held_here = not copy_of or status.get('copy_key') == copy_key(components)
         if status.get('state') == 'ignored' and not force and held_here:
             # Ignored in Fivenines: final. No automatic request at all; Send now
             # asks again, Re-enroll (with a key) proposes the database anew.
@@ -568,8 +576,12 @@ class FiveninesMonitor(models.AbstractModel):
             return self._fn_after_enroll(api_client, directory, state, params, outcome,
                                          components, digest, now)
 
-        if params.get(P_KEY) and params.get(P_ENDPOINT) and self._fn_key_predates_enrollment(params):
-            self._fn_forget_settings_key(params)  # used once (a run that rolled back)
+        if params.get(P_KEY) and params.get(P_ENDPOINT) and (
+                status.get('state') not in KEY_NEEDED_STATES or self._fn_key_predates_enrollment(params)):
+            # used once: the key of a run that rolled back, or a key pasted on a
+            # database that does not need one. Kept only while a Re-enroll needs
+            # it (revoked, ignored, a copy that needs a key) and not yet used.
+            self._fn_forget_settings_key(params)
         return self._fn_push(api_client, directory, state, params, secret, components, digest, now)
 
     @api.model
@@ -660,7 +672,7 @@ class FiveninesMonitor(models.AbstractModel):
                     'name': _server_name(data), 'status_json': status_json or None,
                     'api_url': api_client.base_url}
         if result.kind == fn_client.IGNORED:
-            return self._fn_ignored(state, result, now, digest)
+            return self._fn_ignored(state, result, now, components)
         if result.kind == fn_client.UNAUTHORIZED:
             if kind == 'instance_secret':
                 # the original's secret was revoked: a copy then needs a key.
@@ -677,7 +689,7 @@ class FiveninesMonitor(models.AbstractModel):
                                            digest, reason, previous_instance, force,
                                            changed=changed)
                 self._fn_store({P_STATUS: json.dumps({
-                    'state': 'copy_needs_key', 'at': int(now), 'fingerprint': digest,
+                    'state': 'copy_needs_key', 'at': int(now), 'copy_key': copy_key(components),
                     'message': result.message})})
                 self._fn_sweep(directory, state)
                 return {'result': 'no_key', 'status': result.status}
@@ -694,12 +706,12 @@ class FiveninesMonitor(models.AbstractModel):
                 'message': result.message}
 
     @api.model
-    def _fn_ignored(self, state, result, now, digest):
+    def _fn_ignored(self, state, result, now, components):
         """410: an administrator chose Ignore in Fivenines. Final for this database
-        (`fingerprint`: the digest it was recorded for, see _fn_run_locked)."""
+        (`copy_key`: the copy it was recorded for, see _fn_run_locked)."""
         name = _server_name(result.data)
         self._fn_store({P_STATUS: json.dumps({'state': 'ignored', 'name': name, 'at': int(now),
-                                              'fingerprint': digest})})
+                                              'copy_key': copy_key(components)})})
         state['last_error'] = {'at': now, 'kind': result.kind, 'status': result.status,
                                'message': result.message}
         state.pop('next_attempt_at', None)
@@ -770,7 +782,7 @@ class FiveninesMonitor(models.AbstractModel):
                                                       'at': int(now)})})
             return dict(base, result='pending', name=name, next_attempt_at=state['next_attempt_at'])
         if result.kind == fn_client.IGNORED:
-            return dict(base, **self._fn_ignored(state, result, now, digest))
+            return dict(base, **self._fn_ignored(state, result, now, components))
         if result.kind == fn_client.UNAUTHORIZED:
             # Revoked in Fivenines: stop pushing. Never re-enroll on our own
             # (that would undo the revocation). The secret is kept and tried

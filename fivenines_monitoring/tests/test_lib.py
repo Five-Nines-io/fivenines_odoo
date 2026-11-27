@@ -348,6 +348,22 @@ class TestCollector(BaseCase):
             self.assertLessEqual(len(sample['traceback']), fn_collector.MAX_TRACEBACK + 10)
             self.assertTrue(sample['traceback'].startswith('[cut] '))
 
+    def test_mask_window_never_splits_a_token(self):
+        # Value: protects=the masking window opens on a whitespace, so a long hex secret at its edge is masked whole, never sent as a fragment, even when masks shrink the window; fails_when=the window is cut at a raw offset; why_new=review pass 2 (security); seam=none; no_claim=none
+        secret = 'ab' * 40  # 80 hex chars
+        token = 'cd' * 20 + ' '  # masked to "<hex> ": the window shrinks 7x
+        for keep, limit in (('head', 2000), ('tail', 8000)):
+            size = limit + fn_collector.MASK_MARGIN
+            for shift in range(1, 79, 6):
+                if keep == 'head':
+                    pad = (token * (size // len(token) + 1))[:size - shift]
+                    text = pad.rstrip() + ' ' + secret + ' end'
+                else:
+                    pad = (token * (size // len(token) + 1))[:size - shift]
+                    text = 'start ' + secret + ' ' + pad.lstrip()
+                out = fn_collector._masked_bounded(text, limit, keep)
+                self.assertNotIn('abab', out, (keep, shift))
+
     def test_error_sample_is_built_at_most_every_10_seconds(self):
         # Value: protects=an error storm does not pay the masking cost (~1 ms, under the logging lock) per record: one sample per group per SAMPLE_EVERY, while every occurrence is still counted; fails_when=error_sample runs for every record again; why_new=review of revision 2 (performance, adversarial); seam=patched error_sample; no_claim=wall-clock timings
         calls = []

@@ -194,18 +194,28 @@ def _bounded(text, limit, keep='head'):
 
 
 # Credentials are masked BEFORE the length cut, on a window a bit larger than
-# the bound (the longest masked value is 4096 chars): a cut that fell inside
-# "password: value" would otherwise drop the name and leave the value bare.
-MASK_MARGIN = 4096 + 512
+# the bound: a cut that fell inside "password: value" would otherwise drop the
+# name and leave the value bare. MAX_MASKED_VALUE is the {1,4096} bound of the
+# name=value masks in _CREDENTIAL_MASKS; keep the two in step.
+MAX_MASKED_VALUE = 4096
+MASK_MARGIN = MAX_MASKED_VALUE + 512
 
 
 def _masked_bounded(text, limit, keep='head'):
-    if keep == 'tail':
+    if len(text) <= limit + MASK_MARGIN:
+        window = text
+    elif keep == 'tail':
         window = text[-(limit + MASK_MARGIN):]
-        if len(window) < len(text) and '\n' in window:
-            window = window[window.index('\n') + 1:]  # start on a whole line
+        # open edge on a whole line, else on a whitespace: no token split there
+        edge = window.find('\n')
+        if edge < 0:
+            edge = min([i for i in (window.find(' '), window.find('\t')) if i >= 0] or [-1])
+        window = window[edge + 1:]
     else:
         window = text[:limit + MASK_MARGIN]
+        edge = max(window.rfind(' '), window.rfind('\n'), window.rfind('\t'))
+        if edge > 0:
+            window = window[:edge]
     return _bounded(mask_credentials(window), limit, keep)
 
 
