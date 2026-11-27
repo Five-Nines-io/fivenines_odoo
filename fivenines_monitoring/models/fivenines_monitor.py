@@ -120,6 +120,15 @@ def urls_from(base_url, domains):
     return urls[:MAX_URLS]
 
 
+MAX_SERVER_NAME = 120
+
+
+def _server_name(data):
+    """The display name Fivenines returned, bounded (shown in Settings)."""
+    name = (data or {}).get('name') if isinstance(data, dict) else None
+    return str(name)[:MAX_SERVER_NAME] if name else None
+
+
 def _truthy(value):
     return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
@@ -282,6 +291,19 @@ class FiveninesMonitor(models.AbstractModel):
         if params.get(P_KEY):
             icp_set(self.env['ir.config_parameter'].sudo(), P_KEY, None)
 
+    @api.model
+    def _fn_key_predates_enrollment(self, params):
+        """True when the Settings key was written before the enrollment: the key
+        that enrollment used, still there because its deletion rolled back. A
+        key pasted later (e.g. to Re-enroll a revoked or ignored database) is
+        kept until it is used."""
+        try:
+            enrolled_at = int(params.get(P_ENROLLED_AT) or 0)
+        except ValueError:
+            return False
+        row = self.env['ir.config_parameter'].sudo().search([('key', '=', P_KEY)], limit=1)
+        return bool(row) and bool(enrolled_at) and _epoch(row.write_date) <= enrolled_at
+
     # ------------------------------------------------------------------
     # identity
     # ------------------------------------------------------------------
@@ -403,7 +425,7 @@ class FiveninesMonitor(models.AbstractModel):
         for key, path, _pid, _start in spool.list_process_files(directory):
             doc = spool.read_json(path)
             if doc and isinstance(doc.get('stats'), dict):
-                acked[key] = doc['stats']
+                acked[key] = stats.baseline_of(doc['stats'])
         return {'acked': acked, 'last_ack_end': now, 'seq': 0, 'baseline_reset': True,
                 'stream': uuid.uuid4().hex}
 
@@ -481,11 +503,19 @@ class FiveninesMonitor(models.AbstractModel):
                 # no change that matters (a new component, base_url): adopt
                 self._fn_store({P_FINGERPRINT: json.dumps({'hash': digest, 'components': components})})
 
-        if status.get('state') == 'ignored' and not force and not copy_of:
+        # a status recorded for a copy holds that copy (same digest), not a
+        # later copy of it: a copy of an ignored database still announces itself
+        held_here = not copy_of or status.get('fingerprint') == digest
+        if status.get('state') == 'ignored' and not force and held_here:
             # Ignored in Fivenines: final. No automatic request at all; Send now
             # asks again, Re-enroll (with a key) proposes the database anew.
             self._fn_sweep(directory, state)
             return {'result': 'ignored', 'name': status.get('name')}
+        if (status.get('state') == 'copy_needs_key' and not force and held_here
+                and not key):
+            # the copied secret was refused and no key is configured: wait for one
+            self._fn_sweep(directory, state)
+            return {'result': 'no_key'}
 
         # after the fingerprint check: a copy must not wait for the original's
         # backoff, but it follows the backoff of its own failed announcements
@@ -538,7 +568,7 @@ class FiveninesMonitor(models.AbstractModel):
             return self._fn_after_enroll(api_client, directory, state, params, outcome,
                                          components, digest, now)
 
-        if params.get(P_KEY) and params.get(P_ENDPOINT):
+        if params.get(P_KEY) and params.get(P_ENDPOINT) and self._fn_key_predates_enrollment(params):
             self._fn_forget_settings_key(params)  # used once (a run that rolled back)
         return self._fn_push(api_client, directory, state, params, secret, components, digest, now)
 
@@ -546,6 +576,9 @@ class FiveninesMonitor(models.AbstractModel):
     def _fn_after_enroll(self, api_client, directory, state, params, outcome, components,
                          digest, now):
         """After an enrollment: wait if it is pending, else push at once."""
+        if outcome.get('api_url') and outcome['api_url'] != api_client.base_url:
+            # a key fallback enrolled at the key's own API: push there
+            api_client = fn_client.Client(outcome['api_url'], api_client.user_agent)
         params = dict(params, **{P_INSTANCE: outcome['instance_id'], P_SERVER: None,
                                  P_STATUS: outcome.get('status_json'),
                                  P_SECRET: outcome['secret'], P_ENDPOINT: api_client.base_url})
@@ -603,7 +636,7 @@ class FiveninesMonitor(models.AbstractModel):
         if result.accepted:
             data = result.data
             pending = result.kind == fn_client.PENDING
-            status_json = json.dumps({'state': 'pending', 'name': data.get('name'), 'at': int(now)}) \
+            status_json = json.dumps({'state': 'pending', 'name': _server_name(data), 'at': int(now)}) \
                 if pending else False
             self._fn_store({
                 P_SECRET: data['token'],
@@ -624,19 +657,29 @@ class FiveninesMonitor(models.AbstractModel):
                          ' (waiting for approval)' if pending else '')
             return {'result': 'enrolled', 'instance_id': str(data['instance_id']),
                     'secret': data['token'], 'state': 'pending' if pending else 'monitored',
-                    'name': data.get('name'), 'status_json': status_json or None}
+                    'name': _server_name(data), 'status_json': status_json or None,
+                    'api_url': api_client.base_url}
         if result.kind == fn_client.IGNORED:
-            return self._fn_ignored(state, result, now)
+            return self._fn_ignored(state, result, now, digest)
         if result.kind == fn_client.UNAUTHORIZED:
             if kind == 'instance_secret':
-                # the original's secret was revoked: a copy then needs a key
-                key, _source = self._fn_enrollment_key(params)
+                # the original's secret was revoked: a copy then needs a key.
+                # The key goes to the URL of its own level (_fn_api_url), never
+                # to the stored endpoint the secret came from.
+                key, key_source = self._fn_enrollment_key(params)
                 if key:
-                    return self._fn_enroll(api_client, directory, state, params, components,
+                    try:
+                        key_url = self._fn_api_url(params, key_source)
+                    except ValueError as e:
+                        return {'result': 'config_error', 'message': str(e)}
+                    return self._fn_enroll(fn_client.Client(key_url, api_client.user_agent),
+                                           directory, state, params, components,
                                            digest, reason, previous_instance, force,
                                            changed=changed)
                 self._fn_store({P_STATUS: json.dumps({
-                    'state': 'copy_needs_key', 'at': int(now), 'message': result.message})})
+                    'state': 'copy_needs_key', 'at': int(now), 'fingerprint': digest,
+                    'message': result.message})})
+                self._fn_sweep(directory, state)
                 return {'result': 'no_key', 'status': result.status}
             self._fn_store({P_STATUS: json.dumps({
                 'state': 'enrollment_refused', 'key_hash': _key_hash(value), 'at': int(now),
@@ -651,10 +694,12 @@ class FiveninesMonitor(models.AbstractModel):
                 'message': result.message}
 
     @api.model
-    def _fn_ignored(self, state, result, now):
-        """410: an administrator chose Ignore in Fivenines. Final for this database."""
-        name = (result.data or {}).get('name')
-        self._fn_store({P_STATUS: json.dumps({'state': 'ignored', 'name': name, 'at': int(now)})})
+    def _fn_ignored(self, state, result, now, digest):
+        """410: an administrator chose Ignore in Fivenines. Final for this database
+        (`fingerprint`: the digest it was recorded for, see _fn_run_locked)."""
+        name = _server_name(result.data)
+        self._fn_store({P_STATUS: json.dumps({'state': 'ignored', 'name': name, 'at': int(now),
+                                              'fingerprint': digest})})
         state['last_error'] = {'at': now, 'kind': result.kind, 'status': result.status,
                                'message': result.message}
         state.pop('next_attempt_at', None)
@@ -719,13 +764,13 @@ class FiveninesMonitor(models.AbstractModel):
             state.update(self._fn_fresh_baseline(directory, now))
             state['next_attempt_at'] = now + result.retry_after - 5
             status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
-            name = (result.data or {}).get('name') or status.get('name')
+            name = _server_name(result.data) or status.get('name')
             if status.get('state') != 'pending' or status.get('name') != name:
                 self._fn_store({P_STATUS: json.dumps({'state': 'pending', 'name': name,
                                                       'at': int(now)})})
             return dict(base, result='pending', name=name, next_attempt_at=state['next_attempt_at'])
         if result.kind == fn_client.IGNORED:
-            return dict(base, **self._fn_ignored(state, result, now))
+            return dict(base, **self._fn_ignored(state, result, now, digest))
         if result.kind == fn_client.UNAUTHORIZED:
             # Revoked in Fivenines: stop pushing. Never re-enroll on our own
             # (that would undo the revocation). The secret is kept and tried
@@ -817,7 +862,7 @@ class FiveninesMonitor(models.AbstractModel):
             # rewrites a file that has new data; dropping the baseline of an
             # idle worker would resend its whole history on its next flush)
             if alive:
-                new_acked[key] = current
+                new_acked[key] = stats.baseline_of(current)
                 workers.append({'pid': pid, 'started_at': round(started_at, 2),
                                 'last_flush_at': round(doc.get('flushed_at', 0), 3)})
             else:

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError
 
-from .fivenines_monitor import P_API_URL, P_KEY, P_MESSAGES_OFF, P_PAUSED, icp_get, icp_set
+from .fivenines_monitor import P_API_URL, P_KEY, P_MESSAGES_OFF, P_PAUSED, _truthy, icp_get, icp_set
 
 
 def _fmt_ts(ts):
@@ -43,7 +43,7 @@ class ResConfigSettings(models.TransientModel):
     def get_values(self):
         res = super().get_values()
         off = icp_get(self.env['ir.config_parameter'].sudo(), P_MESSAGES_OFF)
-        res['fivenines_send_error_messages'] = (off or '').lower() not in ('1', 'true')
+        res['fivenines_send_error_messages'] = not _truthy(off)
         return res
 
     def set_values(self):

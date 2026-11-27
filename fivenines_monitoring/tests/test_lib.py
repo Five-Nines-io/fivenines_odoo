@@ -97,6 +97,49 @@ class TestStats(BaseCase):
 
 
 @tagged('post_install', '-at_install', 'fivenines')
+class TestStatsSamples(BaseCase):
+    def _with_sample(self, message, at):
+        s = stats.empty_stats()
+        stats.record_log(s, 'ERROR', 'fp1', {'logger': 'x'}, {'message': message, 'traceback': None, 'at': at},
+                         now=at)
+        return s
+
+    def test_merge_keeps_the_latest_sample(self):
+        # Value: protects=merging process files keeps the newest message whatever the order; fails_when=the comparison is reversed; why_new=review of revision 2 (testing); seam=none; no_claim=none
+        old, new = self._with_sample('old', 100.0), self._with_sample('new', 200.0)
+        for parts in ((old, new), (new, old)):
+            total = stats.empty_stats()
+            for part in parts:
+                stats.merge_into(total, part)
+            entry = total['logs']['fingerprints']['fp1']
+            self.assertEqual((entry['last_message'], entry['count'], entry['last_at']), ('new', 2, 200.0))
+
+    def test_baseline_keeps_counts_only(self):
+        # Value: protects=acknowledged baselines in state.json carry no error texts (delta reads counts only); fails_when=state.json grows by every group's texts on every run; why_new=review of revision 2 (red team, adversarial); seam=none; no_claim=disk usage
+        snap = self._with_sample('boom with a value', 100.0)
+        base = stats.baseline_of(snap)
+        self.assertNotIn('last_message', base['logs']['fingerprints']['fp1'])
+        self.assertEqual(snap['logs']['fingerprints']['fp1']['last_message'], 'boom with a value')
+        stats.record_log(snap, 'ERROR', 'fp1', {'logger': 'x'}, now=101.0)
+        self.assertEqual(stats.delta(snap, base)['logs']['fingerprints']['fp1']['count'], 1)
+
+    def test_payload_text_budget(self):
+        # Value: protects=one push carries at most MAX_TEXT_TOTAL chars of messages and tracebacks, given to the biggest groups first; fails_when=many long tracebacks push the body past the server's 2 MB cap (413 forever); why_new=review of revision 2 (red team); seam=none; no_claim=JSON escaping overhead
+        s = stats.empty_stats()
+        for i in range(50):
+            for _n in range(50 - i):
+                stats.record_log(s, 'ERROR', 'fp%d' % i, {'logger': 'x'},
+                                 {'message': 'm' * 2000, 'traceback': 't' * 8000, 'at': 1.0}, now=1.0)
+        items = stats.logs_payload(s)['fingerprints']
+        sizes = [len(i['last_message'] or '') + len(i['last_traceback'] or '') for i in items]
+        self.assertLessEqual(sum(sizes), stats.MAX_TEXT_TOTAL)
+        self.assertEqual(items[0]['fingerprint'], 'fp0')
+        self.assertEqual(sizes[0], 10000)
+        self.assertIsNone(items[-1]['last_message'])
+        self.assertIsNotNone(items[-1]['last_seen_at'])
+
+
+@tagged('post_install', '-at_install', 'fivenines')
 class TestCollector(BaseCase):
 
     def setUp(self):
@@ -197,7 +240,8 @@ class TestCollector(BaseCase):
                            for e in fps.values()])
         self.assertNotIn('S0001', keys)
         self.assertNotIn('secret customer value', keys)
-        self.assertEqual(by_template['Order %s failed']['last_message'], 'Order S0002 failed')
+        # sampled at most every 10 s per group: the second order, a moment later, keeps the first sample
+        self.assertEqual(by_template['Order %s failed']['last_message'], 'Order S0001 failed')
         self.assertIn('secret customer value', by_template['Boom %s']['last_traceback'])
 
     def test_preformatted_messages_are_masked(self):
@@ -292,6 +336,33 @@ class TestCollector(BaseCase):
         self.assertLessEqual(len(fn_collector.error_sample(long_record)['message']), 2010)
         for text in ('a' * 8000, 'password=' * 1000, ':' * 8000, 'x://' + 'a' * 7990):
             m(text)  # bounded: each runs in well under a second (quadratic patterns would not)
+
+    def test_cut_never_separates_a_secret_from_its_name(self):
+        # Value: protects=a traceback cut at 8000 chars from the end never leaves a credential's value bare because the cut dropped its name; fails_when=masking runs after the cut again; why_new=review of revision 2 (security, adversarial: verified leak); seam=none; no_claim=every credential shape
+        for shift in range(0, 40, 3):
+            tb = 'Traceback\n' + 'a' * shift + ' password: hunter2secret ' + 'y ' * 3990
+            record = logging.LogRecord('odoo.x', logging.ERROR, __file__, 1, 'boom', None, None)
+            record.exc_text = tb
+            sample = fn_collector.error_sample(record)
+            self.assertNotIn('hunter2secret', sample['traceback'])
+            self.assertLessEqual(len(sample['traceback']), fn_collector.MAX_TRACEBACK + 10)
+            self.assertTrue(sample['traceback'].startswith('[cut] '))
+
+    def test_error_sample_is_built_at_most_every_10_seconds(self):
+        # Value: protects=an error storm does not pay the masking cost (~1 ms, under the logging lock) per record: one sample per group per SAMPLE_EVERY, while every occurrence is still counted; fails_when=error_sample runs for every record again; why_new=review of revision 2 (performance, adversarial); seam=patched error_sample; no_claim=wall-clock timings
+        calls = []
+        real = fn_collector.error_sample
+        with patch.object(fn_collector, 'error_sample', lambda r: calls.append(1) or real(r)):
+            def storm():
+                for _i in range(50):
+                    self.handler.emit(logging.LogRecord('odoo.x', logging.ERROR, __file__, 7,
+                                                        'Order %s failed', ('S1',), None))
+            _Thread.run('db_a', storm)
+        snap = self.collector.snapshot('db_a')
+        (entry,) = snap['logs']['fingerprints'].values()
+        self.assertEqual(entry['count'], 50)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(entry['last_message'], 'Order S1 failed')
 
     def test_prefork_master_is_ignored(self):
         # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork
@@ -508,6 +579,26 @@ class TestClient(BaseCase):
         self.assertEqual(fn_client.classify(402, None).kind, fn_client.PAYMENT_REQUIRED)
         for status in (400, 413):
             self.assertEqual(fn_client.classify(status, None).kind, fn_client.REJECTED)
+
+    def test_classify_pending_and_ignored(self):
+        # Value: protects=pending needs the contract's marker and its retry_after is bounded (junk and inf included); a 410 is final only with code "ignored", and a bare 202 is not an acknowledgement; fails_when=a CDN's 410 or a proxy's 202 puts every database in a final or data-dropping state, or retry_after=inf crashes the run; why_new=review of revision 2 (red team, adversarial, testing); seam=none; no_claim=real proxies
+        c = fn_client.classify
+        self.assertEqual(c(202, {'state': 'pending'}).kind, fn_client.PENDING)
+        self.assertEqual(c(200, {'status': 'pending'}).kind, fn_client.PENDING)
+        self.assertEqual(c(202, {'state': 'pending'}).retry_after, 900)
+        self.assertEqual(c(202, {'state': 'pending', 'retry_after': 5}).retry_after, 300)
+        self.assertEqual(c(202, {'state': 'pending', 'retry_after': 10 ** 9}).retry_after, 21600)
+        for junk in ('x', 'inf', float('inf'), '1e999', None):
+            self.assertEqual(c(202, {'state': 'pending', 'retry_after': junk}).retry_after, 900)
+        self.assertEqual(c(202, None).kind, fn_client.RETRY)
+        self.assertEqual(c(202, {'status': 'ok'}).kind, fn_client.RETRY)
+        self.assertEqual(c(410, {'status': 'error', 'code': 'ignored'}).kind, fn_client.IGNORED)
+        self.assertEqual(c(410, None).kind, fn_client.RETRY)
+        self.assertEqual(c(410, {'message': 'Gone'}).kind, fn_client.RETRY)
+
+        class _Resp:
+            headers = {'Retry-After': 'inf'}
+        self.assertIsNone(fn_client._retry_after(_Resp()))
 
     def test_retry_after_header(self):
         # Value: protects=Retry-After parsed, clamped to [0, MAX_RETRY_AFTER], junk ignored; fails_when=clamp/parse removed so server can stall pushes or crash; why_new=_retry_after untested; seam=none; no_claim=HTTP-date form

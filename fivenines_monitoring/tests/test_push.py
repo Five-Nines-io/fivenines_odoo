@@ -528,7 +528,7 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(r.status, 200)
 
     def test_restore_elsewhere_while_original_is_down_is_only_proposed(self):
-        # Value: protects=a production database restored on a test server while production is silent does not take over production's identity: it is proposed (pending), marked as a probable move, and the original keeps its fingerprint and token; fails_when=the server adopts a new place after 15 minutes of silence; why_new=lead review of revision 2 (founder rule); seam=the other place's identity is set on the stub record; no_claim=the real fivenines-server UI
+        # Value: protects=a production database restored on a test server while production is silent does not take over production's identity: it is proposed (pending) and the original keeps its fingerprint and token; a move is never guessed; fails_when=the server adopts a new place after 15 minutes of silence; why_new=lead review of revision 2 (founder rule); seam=the other place's identity is set on the stub record; no_claim=the real fivenines-server UI ("Replaces an existing database")
         self.run_push()
         first = fm.icp_get(self.icp, fm.P_INSTANCE)
         original = self.stub.state.instances[first]
@@ -540,16 +540,12 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual((out['result'], out['state']), ('conflict', 'pending'), out)
         proposal = fm.icp_get(self.icp, fm.P_INSTANCE)
         self.assertNotEqual(proposal, first)
-        state = {i['instance_id']: i for i in self.stub.state.public()['instances']}
-        self.assertEqual((state[proposal]['copy_of'], state[proposal]['reason']), (first, 'conflict'))
-        self.assertTrue(state[proposal]['probable_move'])
-        self.assertFalse(state[first]['probable_move'])
+        record = self.stub.state.instances[proposal]
+        self.assertEqual((record['copy_of'], record['reason'], record['state']),
+                         (first, 'conflict', 'pending'))
         self.assertEqual((original['state'], original['fingerprint']), ('monitored', fingerprint),
                          'production keeps its identity')
         self.assertFalse(original['revoked'])
-        original['last_push_at'] = time.time()  # production is back: no longer a probable move
-        state = {i['instance_id']: i for i in self.stub.state.public()['instances']}
-        self.assertFalse(state[proposal]['probable_move'])
 
     def test_url_change_from_localhost_is_adopted(self):
         fm.icp_set(self.icp, 'web.base.url', 'http://localhost:8069')
@@ -574,10 +570,48 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         # its copied secret is revoked, so it needs a key
         self.assertEqual(self.run_push()['result'], 'no_key')
         self.assertEqual(json.loads(fm.icp_get(self.icp, fm.P_STATUS))['state'], 'copy_needs_key')
+        n = len(self.stub.state.requests)  # it waits for a key without requests (review)
+        for _i in range(3):
+            self.expire_backoff()
+            self.assertEqual(self.run_push()['result'], 'no_key')
+        self.assertEqual(len(self.stub.state.requests), n, 'no request while it needs a key')
         fm.icp_set(self.icp, fm.P_KEY, self.key)
         self.assertEqual(self.run_push()['result'], 'pushed')
         record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
         self.assertEqual((record['credential'], record['reason']), ('enrollment_key', 'fingerprint_changed'))
+
+    def test_copy_key_fallback_never_goes_to_the_stored_endpoint(self):
+        # Value: protects=when a copy's secret is refused, the enrollment key goes to the URL of its own level, never to fivenines.endpoint (a database parameter an admin can edit, or that a restored dump carries); fails_when=a tenant admin points the endpoint at their host, answers 401, and receives the organization's key; why_new=review of revision 2 (security, red team, adversarial); seam=a second stub plays the foreign endpoint; no_claim=TLS
+        self.run_push()
+        other = StubServer([]).start()  # knows no secret: answers 401
+        try:
+            fm.icp_set(self.icp, fm.P_ENDPOINT, other.url)
+            fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+            fm.icp_set(self.icp, fm.P_KEY, self.key)
+            out = self.run_push()
+            self.assertEqual(out['result'], 'pushed', out)
+            self.assertEqual([r['path'] for r in other.state.requests], ['enroll'],
+                             'only the copied secret went to the stored endpoint')
+            instance = fm.icp_get(self.icp, fm.P_INSTANCE)
+            self.assertEqual(self.stub.state.instances[instance]['credential'], 'enrollment_key')
+            self.assertEqual(fm.icp_get(self.icp, fm.P_ENDPOINT), self.stub.url)
+            self.assertEqual(self.stub.state.pushes[-1]['instance_id'], instance,
+                             'the new secret is pushed to the API that issued it')
+        finally:
+            other.stop()
+
+    def test_key_pasted_after_enrollment_is_kept_until_used(self):
+        # Value: protects=a key pasted to Re-enroll a revoked database survives a Send now (only the key an enrollment already used is dropped); fails_when=Send now erases the new key and Re-enroll answers no_key; why_new=review of revision 2 (testing, adversarial); seam=enrolled_at moved back (one test transaction); no_claim=a real rollback
+        self.run_push()
+        requests.post(self.stub.url + '/_stub/revoke', timeout=5,
+                      json={'instance_id': fm.icp_get(self.icp, fm.P_INSTANCE)})
+        self.assertEqual(self.run_push()['result'], 'revoked')
+        fm.icp_set(self.icp, fm.P_ENROLLED_AT, str(int(time.time()) - 2 * 86400))  # enrolled days ago
+        fm.icp_set(self.icp, fm.P_KEY, self.key)  # pasted now
+        self.assertEqual(self.run_push(trigger='manual', force=True)['result'], 'revoked')
+        self.assertEqual(fm.icp_get(self.icp, fm.P_KEY), self.key, 'kept for Re-enroll')
+        self.assertEqual(self.run_push(trigger='manual', force=True, reenroll=True)['result'], 'pushed')
+        self.assertIsNone(fm.icp_get(self.icp, fm.P_KEY), 'used once')
 
     def test_neutralized_copy_stays_silent_until_turned_on(self):
         # Value: protects=Odoo's neutralization is respected (the cron stays off, the secret is kept) and one click turns monitoring on, after which the copy announces itself with the copied secret and lands as proposed; fails_when=neutralize deletes the secret, or the module re-activates its cron by itself; why_new=#7 (founder decision); seam=none; no_claim=Odoo.sh's own staging build
@@ -702,6 +736,15 @@ class TestApproval(FiveninesCase, TransactionCase):
         fm.icp_set(self.icp, fm.P_STATUS, False)
         self.expire_backoff()
         self.assertEqual(self.run_push()['result'], 'ignored')
+        # and it stays silent: no automatic request on the next runs (review)
+        n = len(self.stub.state.requests)
+        for _i in range(3):
+            self.expire_backoff()
+            self.assertEqual(self.run_push()['result'], 'ignored')
+        self.assertEqual(len(self.stub.state.requests), n, 'an ignored copy makes no request')
+        # Send now still asks
+        self.assertEqual(self.run_push(force=True)['result'], 'ignored')
+        self.assertEqual(len(self.stub.state.requests), n + 1)
 
 
 @tagged('post_install', '-at_install', 'fivenines')

@@ -10,6 +10,7 @@ it can be unit tested anywhere.
 
 import bisect
 import copy
+import time
 
 # Upper bounds (milliseconds) of the latency histogram buckets. The last bucket
 # (index len(LATENCY_BOUNDS_MS)) catches everything above the last bound.
@@ -19,6 +20,9 @@ ERROR_LEVELS = ('ERROR', 'CRITICAL')
 # Distinct error fingerprints kept per process and database. Past that, new
 # fingerprints only increment `errors.overflow` so memory stays bounded.
 MAX_FINGERPRINTS = 100
+SAMPLE_EVERY = 10.0  # seconds: an error group's sample is rebuilt at most this often
+MAX_TEXT_TOTAL = 200000  # chars of messages + tracebacks in one push
+SAMPLE_KEYS = ('last_message', 'last_traceback', 'sample_at')
 STATS_VERSION = 1
 
 
@@ -69,9 +73,12 @@ def record_request(stats, code, total_ms, sql_queries, sql_time_ms):
     http['sql_time_ms'] += sql_time_ms
 
 
-def record_log(stats, level, fingerprint, info, sample=None):
-    """Count a log record. `sample` ({message, traceback, at}) is the latest
-    occurrence of an error group; the cron sends it unless messages are off."""
+def record_log(stats, level, fingerprint, info, sample=None, now=None):
+    """Count a log record. `sample` ({message, traceback, at}, or a callable
+    returning it) is the latest occurrence of an error group; the cron sends it
+    unless messages are off. A callable is only called when the group's sample
+    is older than SAMPLE_EVERY: masking costs ~1 ms and runs under the logging
+    lock, so an error storm must not pay it per record."""
     logs = stats['logs']
     if level in logs['levels']:
         logs['levels'][level] += 1
@@ -86,10 +93,16 @@ def record_log(stats, level, fingerprint, info, sample=None):
         entry = dict(info, count=0)
         fps[fingerprint] = entry
     entry['count'] += 1
+    now = time.time() if now is None else now
+    entry['last_at'] = now  # the latest occurrence, sampled or not
+    if callable(sample):
+        if now - (entry.get('sample_at') or 0) < SAMPLE_EVERY:
+            return
+        sample = sample()
     if sample:
         entry['last_message'] = sample.get('message')
         entry['last_traceback'] = sample.get('traceback')
-        entry['last_at'] = sample.get('at')
+        entry['sample_at'] = sample.get('at') or now
 
 
 def delta(current, baseline):
@@ -150,8 +163,10 @@ def merge_into(total, part):
         if fp in tl['fingerprints']:
             mine = tl['fingerprints'][fp]
             mine['count'] += entry['count']
-            if (entry.get('last_at') or 0) > (mine.get('last_at') or 0):  # keep the latest
-                for k in ('last_message', 'last_traceback', 'last_at'):
+            if (entry.get('last_at') or 0) > (mine.get('last_at') or 0):
+                mine['last_at'] = entry['last_at']
+            if (entry.get('sample_at') or 0) > (mine.get('sample_at') or 0):  # keep the latest
+                for k in SAMPLE_KEYS:
                     mine[k] = entry.get(k)
         else:
             tl['fingerprints'][fp] = dict(entry)
@@ -218,6 +233,19 @@ def http_payload(agg, window_seconds, capture_enabled=True):
     }
 
 
+def baseline_of(snapshot):
+    """A snapshot kept as an acknowledged baseline: counts only (delta() reads
+    nothing else), so state.json does not carry every group's texts."""
+    out = copy.deepcopy(snapshot)
+    try:
+        for entry in out['logs']['fingerprints'].values():
+            for k in SAMPLE_KEYS:
+                entry.pop(k, None)
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return out
+
+
 LOG_ITEM_KEYS = ('count', 'logger', 'level', 'message_template', 'exception_type',
                  'exception_origin', 'location')
 
@@ -227,17 +255,24 @@ def logs_payload(agg, max_items=50, messages=True):
 
     With messages on (the default, a settings switch), each group carries its
     latest occurrence's message and traceback (credentials already masked by
-    the collector); off, only groups and counts.
+    the collector), up to MAX_TEXT_TOTAL chars per push in count order (the
+    rest go without texts); off, only groups and counts.
     """
     l = agg['logs']
     items = sorted(l['fingerprints'].items(), key=lambda kv: -kv[1]['count'])
     top = []
+    budget = MAX_TEXT_TOTAL
     for fp, entry in items[:max_items]:
         item = {k: entry.get(k) for k in LOG_ITEM_KEYS}
         item['fingerprint'] = fp
         item['last_seen_at'] = round(entry['last_at'], 3) if entry.get('last_at') else None
-        item['last_message'] = entry.get('last_message') if messages else None
-        item['last_traceback'] = entry.get('last_traceback') if messages else None
+        message, tb = (entry.get('last_message'), entry.get('last_traceback')) if messages else (None, None)
+        size = len(message or '') + len(tb or '')
+        if size > budget:
+            message = tb = None
+        else:
+            budget -= size
+        item['last_message'], item['last_traceback'] = message, tb
         top.append(item)
     return {
         'messages': 'on' if messages else 'off',

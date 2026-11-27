@@ -96,7 +96,7 @@ def _retry_after(response):
     value = response.headers.get('Retry-After')
     try:
         return max(0, min(MAX_RETRY_AFTER, int(float(value))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # missing, junk, inf
         return None
 
 
@@ -108,15 +108,23 @@ def classify(status, body, retry_after=None):
             message = str(message)[:300]
     data = body if isinstance(body, dict) else {}
     if 200 <= status < 300:
-        if status == 202 or data.get('state') == 'pending':
+        if data.get('state') == 'pending' or data.get('status') == 'pending':
             wait = data.get('retry_after', retry_after)
             try:
                 wait = int(float(wait)) if wait is not None else PENDING_DEFAULT
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):  # junk, inf
                 wait = PENDING_DEFAULT
             return Result(PENDING, status, data, message,
                           max(PENDING_MIN, min(PENDING_MAX, wait)))
+        if status == 202:
+            # a 202 without the pending marker (a proxy, a queue): not an
+            # acknowledgement; keep the counters and retry
+            return Result(RETRY, status, data, message, retry_after)
         return Result(OK, status, data, message)
+    if status == 410 and data.get('code') != 'ignored':
+        # 410 Gone without the contract's marker (a retired path, a CDN): not
+        # a decision of Fivenines, so never the final "ignored" state
+        return Result(RETRY, status, data, message, retry_after)
     kind = {
         410: IGNORED,
         401: UNAUTHORIZED,

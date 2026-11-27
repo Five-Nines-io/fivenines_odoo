@@ -193,9 +193,26 @@ def _bounded(text, limit, keep='head'):
     return text[:last + 1] + '[cut]'
 
 
+# Credentials are masked BEFORE the length cut, on a window a bit larger than
+# the bound (the longest masked value is 4096 chars): a cut that fell inside
+# "password: value" would otherwise drop the name and leave the value bare.
+MASK_MARGIN = 4096 + 512
+
+
+def _masked_bounded(text, limit, keep='head'):
+    if keep == 'tail':
+        window = text[-(limit + MASK_MARGIN):]
+        if len(window) < len(text) and '\n' in window:
+            window = window[window.index('\n') + 1:]  # start on a whole line
+    else:
+        window = text[:limit + MASK_MARGIN]
+    return _bounded(mask_credentials(window), limit, keep)
+
+
 def error_sample(record):
     """The latest occurrence of an error group: message and traceback, bounded,
-    with credentials masked. Sent unless the database turned messages off."""
+    with credentials masked. Sent unless the database turned messages off.
+    Built at most once every SAMPLE_EVERY seconds per group (stats.record_log)."""
     try:
         message = record.getMessage()
     except Exception:  # noqa: BLE001 - a broken %-format must not lose the sample
@@ -206,8 +223,8 @@ def error_sample(record):
     if record.stack_info:
         tb = (tb + '\n' if tb else '') + record.stack_info
     return {
-        'message': mask_credentials(_bounded(strip_ansi(message), MAX_MESSAGE)),
-        'traceback': mask_credentials(_bounded(tb, MAX_TRACEBACK, keep='tail')) if tb else None,
+        'message': _masked_bounded(strip_ansi(message), MAX_MESSAGE),
+        'traceback': _masked_bounded(tb, MAX_TRACEBACK, keep='tail') if tb else None,
         'at': record.created,
     }
 
@@ -327,7 +344,8 @@ class FiveninesHandler(logging.Handler):
                     self.collector.on_log(dbname, level, None, None)
                 else:
                     fp, info = log_fingerprint(record)
-                    self.collector.on_log(dbname, level, fp, info, error_sample(record))
+                    # built lazily: at most once every SAMPLE_EVERY s per group
+                    self.collector.on_log(dbname, level, fp, info, lambda: error_sample(record))
         except Exception:  # noqa: BLE001 - monitoring must never break logging
             pass
 

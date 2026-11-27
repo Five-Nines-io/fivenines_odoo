@@ -37,7 +37,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_DIR = os.path.join(HERE, 'schemas')
-MOVE_SILENCE = 900  # seconds: a proposal whose original is silent this long is a probable move
 MAX_BODY = 2 * 1024 * 1024
 
 
@@ -128,21 +127,11 @@ class StubState:
         self.push_schema = load_schema('push_payload.schema.json')
         self.schema_errors = []
 
-    def probable_move(self, inst, now=None):
-        """A proposal (pending copy) whose original has been silent for
-        MOVE_SILENCE: the UI offers "probably a move: take its place"."""
-        original = self.instances.get(inst.get('copy_of') or '')
-        if inst.get('state') != 'pending' or not original:
-            return False
-        last = original.get('last_push_at')
-        return last is None or (now or time.time()) - last >= MOVE_SILENCE
-
     def public(self):
         with self.lock:
             return {
                 'instances': [
-                    dict({k: v for k, v in inst.items() if k != 'token'},
-                         probable_move=self.probable_move(inst))
+                    {k: v for k, v in inst.items() if k != 'token'}
                     for inst in self.instances.values()
                 ],
                 'push_count': len(self.pushes),
