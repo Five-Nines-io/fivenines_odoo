@@ -468,6 +468,33 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(record['previous_instance_id'], first)
         self.assertEqual(self.stub.state.instances[first]['state'], 'monitored', 'the original is untouched')
 
+    def test_failed_copy_announcement_backs_off(self):
+        # Value: protects=a copy announces itself at once even while the original backs off, but its own failed announcements follow the bounded backoff (contract s7); fails_when=every copy calls /enroll every minute while Fivenines is down, or a copy waits for the original's schedule; why_new=lead review of revision 2; seam=none; no_claim=real outage timings
+        self.run_push()
+        self.fail_next(503)
+        self.assertEqual(self.run_push()['result'], 'push_failed')
+        self.assertGreater(self.state_file()['next_attempt_at'], time.time(), 'the original backs off')
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        self.fail_next(503, count=10, path='enroll')
+        self.assertEqual(self.run_push()['result'], 'enroll_failed', "no wait for the original's backoff")
+        announced = len(self.stub_requests('enroll'))
+        for failures in (2, 3, 4):
+            out = self.run_push()
+            self.assertEqual(out['result'], 'backoff', out)
+            self.assertEqual(len(self.stub_requests('enroll')), announced, 'no request during the backoff')
+            self.expire_backoff()
+            self.assertEqual(self.run_push()['result'], 'enroll_failed')
+            announced += 1
+            self.assertEqual(len(self.stub_requests('enroll')), announced)
+            self.assertEqual(self.state_file()['failures'], failures + 1)
+        # after 5 failures in a row the next announcement is 4 minutes away
+        self.assertGreater(self.state_file()['next_attempt_at'], time.time() + 200)
+        self.expire_backoff()
+        self.stub.state.failures.clear()
+        out = self.run_push()
+        self.assertEqual(out['result'], 'pending', out)
+        self.assertNotIn('backoff_fingerprint', self.state_file())
+
     def test_new_public_url_is_adopted_until_acked(self):
         # Value: protects=a base_url-only change (admin login via an alias) keeps the instance and is flagged until a push is acked; fails_when=a URL change re-enrolls, or a failed push loses the flag and the 409 rule splits the instance; why_new=red-team RT2 + state-machine SM1, decision D3; seam=none; no_claim=real admin login (param set directly)
         self.run_push()

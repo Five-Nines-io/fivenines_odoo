@@ -487,8 +487,11 @@ class FiveninesMonitor(models.AbstractModel):
             self._fn_sweep(directory, state)
             return {'result': 'ignored', 'name': status.get('name')}
 
-        # after the fingerprint check: a copy must not wait for the original's backoff
-        if not force and not copy_of and state.get('next_attempt_at', 0) > now:
+        # after the fingerprint check: a copy must not wait for the original's
+        # backoff, but it follows the backoff of its own failed announcements
+        # (state['backoff_fingerprint'] = the digest that failed)
+        own_backoff = not copy_of or state.get('backoff_fingerprint') == digest
+        if not force and own_backoff and state.get('next_attempt_at', 0) > now:
             if status.get('state') in ('revoked', 'pending'):
                 self._fn_sweep(directory, state)
             return {'result': status.get('state') if status.get('state') in ('revoked', 'pending')
@@ -513,6 +516,8 @@ class FiveninesMonitor(models.AbstractModel):
                                       credential=('instance_secret', secret),
                                       changed=copy_of['changed'])
             if outcome.get('result') != 'enrolled':
+                if outcome.get('result') == 'enroll_failed':
+                    state['backoff_fingerprint'] = digest  # this copy's own backoff
                 return outcome
             return self._fn_after_enroll(api_client, directory, state, params, outcome,
                                          components, digest, now)
