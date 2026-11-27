@@ -971,6 +971,96 @@ class TestApproval(FiveninesCase, TransactionCase):
         self.assertEqual(self.run_push(force=True)['result'], 'ignored')
         self.assertEqual(len(self.stub.state.requests), n + 1)
 
+    def test_accepted_copy_reannouncing_gets_409(self):
+        # Value: protects=an ACCEPTED copy that announces itself again with the copied secret (staging refreshed from production) gets a 409 whatever its silence: it never gets its secret back, never takes over; the module then waits for a key (silent) or, with a key, lands as a new proposal; fails_when=the server hands the accepted copy's token to a new place, or the module retries the 409 forever; why_new=#11; seam=the refresh is simulated by restoring the original's parameters; no_claim=server persistence
+        requests.post(self.stub.url + '/_stub/policy', json={'new': 'monitored'}, timeout=5)
+        self.run_push()
+        original = {k: fm.icp_get(self.icp, k) for k in (fm.P_SECRET, fm.P_FINGERPRINT, fm.P_INSTANCE)}
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        self.assertEqual(self.run_push()['result'], 'pending')
+        copy_id = fm.icp_get(self.icp, fm.P_INSTANCE)
+        copy_secret = fm.icp_get(self.icp, fm.P_SECRET)
+        requests.post(self.stub.url + '/_stub/accept', json={'instance_id': copy_id}, timeout=5)
+        for k, v in original.items():  # staging refreshed from production
+            fm.icp_set(self.icp, k, v)
+        fm.icp_set(self.icp, fm.P_STATUS, False)
+        self.expire_backoff()
+        out = self.run_push()
+        self.assertEqual(out['result'], 'no_key', out)
+        self.assertEqual(self.stub.state.requests[-1]['status'], 409)
+        self.assertEqual(json.loads(fm.icp_get(self.icp, fm.P_STATUS))['state'], 'copy_needs_key')
+        self.assertNotEqual(fm.icp_get(self.icp, fm.P_SECRET), copy_secret, 'never gets the secret back')
+        n = len(self.stub.state.requests)
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'no_key')
+        self.assertEqual(len(self.stub.state.requests), n, 'waits for a key, silently')
+        fm.icp_set(self.icp, fm.P_KEY, self.key)
+        self.assertEqual(self.run_push()['result'], 'pending', 'with a key: a new proposal')
+        proposal = fm.icp_get(self.icp, fm.P_INSTANCE)
+        self.assertNotIn(proposal, (copy_id, original[fm.P_INSTANCE]))
+        self.assertEqual(self.stub.state.instances[copy_id]['state'], 'monitored', 'the accepted copy is untouched')
+
+    def test_copy_of_a_disabled_database_needs_a_key(self):
+        # Value: protects=/enroll with a secret whose own database is disabled answers 403; the copy then waits for a key (silent) or lands as a proposal with one; fails_when=the copy retries hourly forever or is added; why_new=#11; seam=none; no_claim=server policy
+        requests.post(self.stub.url + '/_stub/policy', json={'new': 'monitored'}, timeout=5)
+        self.run_push()
+        original = fm.icp_get(self.icp, fm.P_INSTANCE)
+        requests.post(self.stub.url + '/_stub/disable', json={'instance_id': original}, timeout=5)
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['status'], 403, 'the disabled original itself holds (1 h)')
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        out = self.run_push()
+        self.assertEqual((out['result'], out.get('status')), ('no_key', 403), out)
+        n = len(self.stub.state.requests)
+        self.expire_backoff()
+        self.assertEqual(self.run_push()['result'], 'no_key')
+        self.assertEqual(len(self.stub.state.requests), n)
+        fm.icp_set(self.icp, fm.P_KEY, self.key)
+        self.assertEqual(self.run_push()['result'], 'pending')
+        self.assertEqual(self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]['copy_of'], original)
+
+    def test_stub_heartbeat_from_other_copy_components_is_not_recorded(self):
+        # Value: protects=a paused heartbeat whose copy components differ from the instance's (a copy carrying the secret) is answered 200 but does not mark the database paused; fails_when=a copy marks the original Paused; why_new=#11; seam=a heartbeat body edited by the test; no_claim=the module (it never sends one from a copy)
+        requests.post(self.stub.url + '/_stub/policy', json={'new': 'monitored'}, timeout=5)
+        self.run_push()
+        instance = fm.icp_get(self.icp, fm.P_INSTANCE)
+        fm.icp_set(self.icp, fm.P_PAUSED, True)
+        self.run_push(trigger='manual', force=True)
+        record = self.stub.state.instances[instance]
+        self.assertIn('paused_at', record)
+        del record['paused_at']
+        body = json.loads(json.dumps(self.stub.state.heartbeats[-1]['body']))
+        body['instance']['fingerprint_components']['database_uuid'] = 'another-copy'
+        r = fn_client.Client(self.stub.url, 'test').push(fm.icp_get(self.icp, fm.P_SECRET), body)
+        self.assertEqual((r.status, r.data.get('state')), (200, 'paused'))
+        self.assertNotIn('paused_at', record, 'answered, not recorded')
+
+    def test_lone_surrogates_never_reach_the_wire(self):
+        # Value: protects=a logged error holding lone surrogates is pushed as valid Unicode (the strict stub, like the server, answers 400 to an escaped lone surrogate); fails_when=every push is refused until Odoo logs a newer occurrence; why_new=#11; seam=a process file written by the test; no_claim=the real server parser
+        requests.post(self.stub.url + '/_stub/policy', json={'new': 'monitored'}, timeout=5)
+        self.run_push()
+        s = stats.empty_stats()
+        stats.record_log(s, 'ERROR', 'f00dfeed', {
+            'logger': 'odoo.x', 'level': 'ERROR', 'message_template': 'cannot read %s',
+            'exception_type': 'OSError', 'exception_origin': None, 'location': 'x.py:1'},
+            {'message': 'cannot read ' + b'/srv/\xff'.decode('utf-8', 'surrogateescape'),
+             'traceback': 'OSError: \ud800', 'at': time.time()})
+        spool.write_json_atomic(os.path.join(self.spool_dir, spool.proc_filename(4194002, 1.0)),
+                                {'pid': 4194002, 'ppid': 1, 'started_at': 1.0, 'flushed_at': time.time(),
+                                 'stats': s})
+        out = self.run_push()
+        self.assertEqual(out['result'], 'pushed', out)
+        group = self.last_payload()['logs']['fingerprints'][0]
+        self.assertEqual((group['last_message'], group['last_traceback']),
+                         ('cannot read /srv/\ufffd', 'OSError: \ufffd'))
+        # the stub is as strict as the server: a raw lone surrogate is a 400
+        import gzip
+        raw = gzip.compress(json.dumps({'kind': 'metrics', 'x': '\udc80'}).encode())
+        r = requests.post(self.stub.url + '/odoo/v1/collect', data=raw, timeout=5, headers={
+            'Authorization': 'Bearer ' + fm.icp_get(self.icp, fm.P_SECRET), 'Content-Encoding': 'gzip',
+            'Content-Type': 'application/json'})
+        self.assertEqual(r.status_code, 400)
+
     def test_copy_of_an_ignored_original_still_announces_itself(self):
         # Value: protects=Ignore holds the database it was given for, not its later copies: a copy of an ignored database announces itself and is proposed; fails_when=the hold ignores which copy it was recorded for; why_new=review pass 2 (testing, state-machines); seam=none; no_claim=server policy for copies of ignored databases
         self.run_push()

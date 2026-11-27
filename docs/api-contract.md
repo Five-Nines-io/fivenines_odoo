@@ -68,7 +68,7 @@ When this document and a schema disagree, the schema wins. Fix both in the same 
 | Header | Value |
 |---|---|
 | `Authorization` | On `/enroll`: `Bearer <enrollment key>`, or `Bearer <instance token>` when a copy announces itself with the secret it carries (the body's `credential` says which). On `/collect`: `Bearer <instance token>`. The ONLY place a credential appears: never in the URL or the body. The server reads it like `ApiController#client_token`: last space-separated word. |
-| `Content-Type` | `application/json` |
+| `Content-Type` | `application/json`: the body is UTF-8 JSON. **All strings are valid Unicode; lone surrogates are replaced by U+FFFD** (Python can hold them, e.g. surrogateescape-decoded bytes in a log message or a path; escaped, `\udc80`, they would break strict parsers). The module does this for every string it sends, keys included; a valid surrogate pair is kept. The server does NOT repair them: a body with an escaped lone surrogate is malformed, answered 400. |
 | `Content-Encoding` | `gzip`. The module always compresses. The server must inflate (the agent API already does this in its middleware) and apply its body cap AFTER inflation. 2 MB is plenty: a real push is 3-30 KB of JSON before compression. |
 | `Accept` | `application/json` |
 | `User-Agent` | `fivenines-odoo/<module version> (Odoo <release.version>; Python <x.y.z>)`, e.g. `fivenines-odoo/19.0.1.0 (Odoo 19.0; Python 3.12.3)` |
@@ -180,10 +180,16 @@ enrollment (the issue's install flow, step 4), or attach the existing monitors w
   stays silent, while a new copy of an ignored database still announces itself (its fingerprint
   changed). A `410` WITHOUT `code: "ignored"` (a retired path, a CDN) is a retryable failure,
   never the final state; likewise a `202` without `state: "pending"` is not an acknowledgement.
-- **A copy whose copied secret is refused** (`401`) enrolls with the enrollment key at once,
+- **A copy whose copied secret cannot announce it** enrolls with the enrollment key at once,
   sent to the URL of the key's own level (section 2), never to the endpoint that issued the
-  refused secret. Without a key it records `copy_needs_key` and makes no request until a key is
-  configured or "Send now" is clicked.
+  secret; as a copy (`fingerprint_changed` or `conflict`) it lands pending. Without a key it
+  records `copy_needs_key` and makes no request until a key is configured or "Send now" is
+  clicked. This happens on:
+  - `401`: the secret's own database is revoked (or the secret is unknown);
+  - `403`: the secret's own database is disabled;
+  - `409`: this copy was already ACCEPTED (monitored) in Fivenines and announces itself again
+    with the copied secret (e.g. staging refreshed from production), whatever its silence. It
+    never gets its own secret back and never takes over.
 - Pending and ignored show on the settings screen with the `name` the server returned.
 - The holds above (ignored, `copy_needs_key`) are recorded with the copy they apply to (its
   database name, uuid, stage and neutralized flag, not `base_url`): an admin login that rewrites
@@ -198,7 +204,7 @@ Server notes:
 - `token`: `SecureRandom.hex(32)`, unique, revocable on its own, like `Host#client_token`.
 - Store the fingerprint (hash + components) on the instance (needed for the 409 rule).
 - An enrollment with `credential: "instance_secret"`: authenticate the secret like `/collect`
-  (401 when unknown or revoked). If the fingerprint equals the instance's stored one and the
+  (401 when unknown or revoked, 403 when that secret's own database is disabled). If the fingerprint equals the instance's stored one and the
   reason is not `conflict`, answer that same instance (200, nothing changes). Otherwise this is a
   copy of that instance, in the same organization: create a NEW instance with a new token,
   `previous_instance_id` = the secret's instance, state `pending`, and answer 202. The original
@@ -206,7 +212,8 @@ Server notes:
   database name, uuid, stage and neutralized flag; `base_url` aside, an admin login rewrites it)
   already exists, answer that one (after a `conflict`, whose copy differs from the original by
   its place only, the same copy is the one with the same full fingerprint): an ignored copy stays ignored (410), a pending one
-  gets its token back.
+  gets its token back, an ACCEPTED one is answered **409**, whatever its silence (its token is
+  never handed out again, and the announcing place never takes over).
 - With the enrollment key:
   - `reason` `fingerprint_changed` or `conflict` (a copy, e.g. one whose copied secret got a
     401 and fell back to a configured key, possibly server-wide): **always pending (202)**, never
@@ -441,6 +448,9 @@ instead of firing "stopped sending":
 - The server shows **Paused** while the last heartbeat is newer than the last metrics push and
   younger than 3 x `every_seconds`, and holds the "stopped sending" alert meanwhile. If the
   heartbeats stop too, it reads it as not receiving, as usual.
+- A heartbeat whose copy components (database name, uuid, stage, neutralized flag) differ from
+  the instance's is answered `200` but NOT recorded: a copy carrying the secret never marks the
+  original Paused (the module does not send one from a copy anyway).
 - Answers: `200` (`{"status": "ok", "state": "paused"}`), and like a push: `202` pending,
   `410` ignored, `401` revoked (the module records these statuses). Anything else: the module
   tries again at the next heartbeat, never sooner.
@@ -637,7 +647,8 @@ and ignored), validates both bodies against the schemas (422 on drift), and offe
 endpoints on loopback: `GET /_stub/state`, `POST /_stub/revoke {"instance_id"}`,
 `POST /_stub/revoke_key {"key"}`, `POST /_stub/fail {"status", "count", "path", "retry_after"}`,
 `POST /_stub/accept {"instance_id"}` (Monitor a pending database),
-`POST /_stub/ignore {"instance_id"}` (Ignore it), `POST /_stub/policy {"new", "retry_after"}`
+`POST /_stub/ignore {"instance_id"}` (Ignore it), `POST /_stub/disable {"instance_id",
+"disabled"}` (403 on its pushes and on `/enroll` with its secret), `POST /_stub/policy {"new", "retry_after"}`
 (new databases start `monitored` or `pending`; the pending check interval),
 `POST /_stub/reset`. It records paused heartbeats in `heartbeats` (`paused_at` on the instance).
 
@@ -657,4 +668,7 @@ Example bodies, valid against the schemas and kept so by the module's tests, liv
   guessed; failed copy announcements back off; rule 1 adopts only from a place stable over the
   accepted pushes it has (up to 3); a paused heartbeat (`kind: "heartbeat"`) every 15 minutes;
   canonical example bodies next to the schemas; a key enrollment of a copy (`fingerprint_changed`
-  or `conflict`) is always pending.
+  or `conflict`) is always pending; every string is valid Unicode (lone surrogates replaced by
+  U+FFFD, 400 otherwise); `/enroll` answers 409 to an accepted copy announcing itself again and
+  401/403 when the secret's own database is revoked/disabled; a heartbeat from other copy
+  components is answered 200 but not recorded.

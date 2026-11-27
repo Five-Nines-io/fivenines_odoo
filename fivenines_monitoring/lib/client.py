@@ -9,6 +9,7 @@ and a short server message only.
 import gzip
 import ipaddress
 import json
+import re
 from urllib.parse import urlsplit
 
 import requests
@@ -139,13 +140,45 @@ def classify(status, body, retry_after=None):
     return Result(kind, status, data, message, retry_after)
 
 
+_SURROGATE = re.compile('[\ud800-\udfff]')
+
+
+def wire_text(text):
+    """`text` as valid Unicode: lone surrogates (e.g. from surrogateescape-
+    decoded bytes in a log message or a path) become U+FFFD; a valid pair is
+    kept. json.dumps would otherwise emit escapes like \\udc80, which strict
+    parsers refuse (contract s2)."""
+    if not _SURROGATE.search(text):
+        return text
+    return text.encode('utf-16-le', 'surrogatepass').decode('utf-16-le', 'replace')
+
+
+def wire_safe(value):
+    """A JSON-ready copy of `value` with every string (keys too) wire_text'ed.
+    Anything that is not a JSON type is sent as its str()."""
+    if isinstance(value, str):
+        return wire_text(value)
+    if isinstance(value, dict):
+        return {wire_text(str(k)): wire_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [wire_safe(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return wire_text(str(value))
+
+
+def encode_body(payload):
+    """The bytes sent for `payload`: compact JSON, valid UTF-8, gzipped."""
+    return gzip.compress(json.dumps(wire_safe(payload), separators=(',', ':')).encode('utf-8'))
+
+
 class Client:
     def __init__(self, base_url, user_agent):
         self.base_url = base_url
         self.user_agent = user_agent
 
     def _post(self, path, token, payload):
-        body = gzip.compress(json.dumps(payload, separators=(',', ':'), default=str).encode('utf-8'))
+        body = encode_body(payload)
         headers = {
             'Authorization': 'Bearer %s' % token,
             'Content-Type': 'application/json',
