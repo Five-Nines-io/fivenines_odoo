@@ -20,12 +20,24 @@
 
 **Why:** Both streams are accepted on one instance (dedup is per `stream_id`), so their counters add up. The contract says the server tells copies apart; for this case it does not.
 
-Worse since revision 2 (review of PR #2, red team): such a copy's pushes interleave with production's, and when its admin logs in (Odoo rewrites `web.base.url`) while it was the last pusher, rule 1 ("same identity as the last accepted push: adopt") moves production's instance to the copy's fingerprint. Production then gets the 409 and lands as a pending copy: the takeover the founder's rule forbids.
+The takeover through rule 1 is closed (lead decision): a URL change is adopted only from the same identity and stream over the last 3 accepted pushes (`test_same_fingerprint_copy_pushing_last_cannot_take_production`). The interleaving itself remains.
 
-**Context:** answer 409 (or flag) when the fingerprint is equal but identity and `stream_id` differ from the last accepted push within 15 minutes; and adopt a fingerprint change under rule 1 only when the identity (and `stream_id`) was stable over several pushes, not just the last one. Needs the lead's decision (rule 1 "stays" per the revision 2 brief).
+**Context:** answer 409 (or flag) when the fingerprint is equal but identity and `stream_id` differ from the last accepted push within 15 minutes. Conflicts with the multi-node limitation below (two nodes look exactly like this), so it needs node awareness first.
 
 **Effort:** S
 **Priority:** P2
+**Depends on:** the server PR
+
+### Node-aware multi-node Odoo
+
+**What:** Model several Odoo nodes sharing one database: send a stable `node_id` (e.g. `/etc/machine-id` hashed with the database name, or a random id kept in the host-local `state.json`) with each push, key `system`/`process` gauges and streams by node on the server, and apply rule 1's stability per node.
+
+**Why:** In v1 (contract section 5, "Limitation: multi-node Odoo") pushes alternate between nodes, gauges flip between machines and every URL change becomes a proposal.
+
+**Context:** module: one field in the payload and the schema (cheap); server: per-node gauges and the per-node rule 1 (the real work). Each node's cron run only sees its own spool, so per-node counters already come apart by `stream_id`.
+
+**Effort:** M (server), S (module)
+**Priority:** P3
 **Depends on:** the server PR
 
 ## Module: enrollment and state
