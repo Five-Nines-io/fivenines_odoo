@@ -92,6 +92,25 @@ Worse since revision 2 (review of PR #2, red team): such a copy's pushes interle
 **Priority:** P2
 **Depends on:** None
 
+### Review notes on revision 2 (below the blocking floor)
+
+**What:** From the PR #2 review of 41e9fb2..HEAD, not fixed:
+- `lib/collector.py` `_masked_bounded`: when the last limit+4608 chars of a traceback hold no newline in the margin, the window opens at the first whitespace; if that whitespace sits between a secret's name and its value (`password: value`) and masks then shrink the window, the value can reach the output unmasked. Predates the range.
+- `lib/collector.py` masks: a DSN password containing an unencoded `@` or `/` is only partly masked.
+- Odoo 20: a failure while sending a response body is logged on `odoo.http.server` at ERROR; that request is not counted in `http`, it becomes an error group.
+- `fivenines.endpoint` pinning: an operator who moves `fivenines_api_url` (migration, region) only reaches enrolled databases through a per-database Re-enroll.
+- Error samples are built even when "Send error messages" is off (they reach spool files, not the payload).
+- Settings: the "Turn it on" button is always visible (founder wording); `_fn_status` returns an unused `messages` key.
+- A status written before revision 2 (no `copy_key`) on a copy: the copy announces once more, then is held.
+
+**Why:** Each is a real but narrow edge; none fails a test, breaks production or loses data in the intended case.
+
+**Context:** review log of PR #2 (pass 1, pass 2, fix-check).
+
+**Effort:** S each
+**Priority:** P3
+**Depends on:** None
+
 ## Module: settings UX
 
 ### Notification and status wording
