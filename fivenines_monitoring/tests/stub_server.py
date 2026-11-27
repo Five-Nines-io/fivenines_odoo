@@ -125,6 +125,9 @@ class StubState:
         self.log_file = log_file
         self.enroll_schema = load_schema('enroll_request.schema.json')
         self.push_schema = load_schema('push_payload.schema.json')
+        self.heartbeat_schema = load_schema('heartbeat.schema.json')
+        self.heartbeats = []
+        self.enroll_bodies = []
         self.schema_errors = []
 
     def public(self):
@@ -261,6 +264,8 @@ class Handler(BaseHTTPRequestHandler):
                 st.instances.clear()
                 st.tokens.clear()
                 st.pushes.clear()
+                st.heartbeats.clear()
+                st.enroll_bodies.clear()
                 st.requests.clear()
                 st.failures.clear()
                 st.schema_errors.clear()
@@ -340,6 +345,8 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self._record('enroll', err)
             return self._send(err, {'status': 'error', 'message': 'invalid body'})
+        with st.lock:
+            st.enroll_bodies.append(body)
         errors = validate(body, st.enroll_schema) if st.enroll_schema else []
         if errors:
             with st.lock:
@@ -407,13 +414,19 @@ class Handler(BaseHTTPRequestHandler):
             self._record('collect', 410, instance_id)
             return self._send(410, {'status': 'error', 'code': 'ignored', 'name': inst['name'],
                                     'message': 'This database is ignored in Fivenines'})
-        errors = validate(body, st.push_schema) if st.push_schema else []
+        heartbeat = isinstance(body, dict) and body.get('kind') == 'heartbeat'
+        schema = st.heartbeat_schema if heartbeat else st.push_schema
+        errors = validate(body, schema) if schema else []
         if errors:
             with st.lock:
                 st.schema_errors.append({'path': 'collect', 'errors': errors[:20]})
             self._record('collect', 422, instance_id)
             return self._send(422, {'status': 'error', 'message': 'invalid payload',
                                     'errors': errors[:20]})
+        if heartbeat:
+            with st.lock:
+                st.heartbeats.append({'instance_id': instance_id, 'received_at': time.time(),
+                                      'body': body})
         if inst.get('state') == 'pending':
             # waiting for approval: nothing is stored
             with st.lock:
@@ -422,6 +435,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(202, {'status': 'pending', 'state': 'pending', 'name': inst['name'],
                                     'retry_after': st.retry_after})
         now = time.time()
+        if heartbeat:
+            # contract s4: paused, no metrics. No 409 rule, no fingerprint
+            # adoption, no counters: only "paused, last heard at".
+            with st.lock:
+                inst['paused_at'] = now
+                inst['paused_since'] = body['paused_since']
+                inst['heartbeat_every'] = body['every_seconds']
+            self._record('collect', 200, instance_id)
+            return self._send(200, {'status': 'ok', 'state': 'paused'})
         fingerprint = body['instance']['fingerprint']
         process = body.get('process') or {}
         identity = (body['instance'].get('hostname'), process.get('pid'), process.get('started_at'))

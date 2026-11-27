@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "credential": "enrollment_key",
+  "reason": "first_enrollment",
+  "previous_instance_id": null,
+  "changed": [],
+  "key_source": "settings",
+  "instance": {
+    "fingerprint": "acaa122f6652bffedb182f31e31ea85d8f8851021b75e35f690a616f960c65e5",
+    "fingerprint_components": {
+      "database": "odoo",
+      "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+      "base_url": "https://erp.example.com",
+      "odoo_stage": null,
+      "neutralized": false
+    },
+    "database": "odoo",
+    "database_uuid": "69bc4150-e9e8-11f1-9a52-06616917c26d",
+    "base_url": "https://erp.example.com",
+    "odoo_stage": null,
+    "urls": [
+      "https://erp.example.com"
+    ],
+    "odoo_version": "19.0",
+    "odoo_serie": "19.0",
+    "odoo_version_info": [
+      19,
+      0,
+      0,
+      "final",
+      0,
+      ""
+    ],
+    "edition": "community",
+    "module_version": "19.0.1.0",
+    "python_version": "3.11.2",
+    "hostname": "odoo-vm",
+    "workers": 0,
+    "max_cron_threads": 2
+  }
+}

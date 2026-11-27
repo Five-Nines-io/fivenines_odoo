@@ -66,7 +66,7 @@ submodule to the newer tag), then upgrade the module: Apps > Fivenines Monitorin
 |---|---|---|---|
 | Enrollment key | "Fivenines enrollment key" | `fivenines_enrollment_key` | `FIVENINES_ENROLLMENT_KEY` |
 | API URL (default `https://api.fivenines.io`) | "Fivenines API URL" (developer mode) | `fivenines_api_url` | `FIVENINES_API_URL` |
-| Pause this database | "Pause monitoring" | - | - |
+| Pause this database (Fivenines then shows it as Paused: a heartbeat every 15 min, no metrics) | "Pause monitoring" | - | - |
 | Send error messages and tracebacks (default on) | "Send error messages" | - | - |
 | Allow plain `http://` API URLs (testing only) | - | `fivenines_allow_insecure_http = True` | `FIVENINES_ALLOW_INSECURE_HTTP` |
 | Keep counting requests with `log_level = warn` (default on) | - | `fivenines_capture_quiet_werkzeug` | `FIVENINES_CAPTURE_QUIET_WERKZEUG` |

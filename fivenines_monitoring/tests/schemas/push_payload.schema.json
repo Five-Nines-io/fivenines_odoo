@@ -26,6 +26,12 @@
         1
       ]
     },
+    "kind": {
+      "enum": [
+        "metrics"
+      ],
+      "description": "A metrics push. Absent means metrics; a paused heartbeat is kind \"heartbeat\" (heartbeat.schema.json)."
+    },
     "sent_at": {
       "type": "number",
       "minimum": 0,

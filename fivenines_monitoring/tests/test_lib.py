@@ -644,6 +644,27 @@ class TestClient(BaseCase):
         self.assertEqual(adapt_version(version), '%s.%s' % (release.major_version, version))
         self.assertTrue(re.match(r'^[0-9]+\.[0-9]+$', version))
 
+    def test_canonical_examples_match_the_schemas(self):
+        # Value: protects=the example bodies the server vendors byte-identical stay valid against the schemas and keep one canonical formatting; fails_when=a schema or an example drifts; why_new=lead request (canonical fixtures); seam=none; no_claim=the server's own validation
+        from .stub_server import load_schema, validate
+        here = os.path.join(os.path.dirname(__file__), 'schemas')
+        examples = os.path.join(here, 'examples')
+        schemas = {'enroll_': 'enroll_request.schema.json', 'push_': 'push_payload.schema.json',
+                   'heartbeat_': 'heartbeat.schema.json'}
+        names = sorted(os.listdir(examples))
+        self.assertEqual(names, ['enroll_conflict_reannounce.json', 'enroll_copy_with_secret.json',
+                                 'enroll_with_key.json', 'heartbeat_paused.json', 'push_full.json',
+                                 'push_null_blocks.json'])
+        for name in names:
+            with open(os.path.join(examples, name), encoding='utf-8') as f:
+                raw = f.read()
+            body = json.loads(raw)
+            self.assertEqual(raw, json.dumps(body, indent=2, ensure_ascii=False) + '\n', name)
+            schema = load_schema(next(v for k, v in schemas.items() if name.startswith(k)))
+            self.assertEqual(validate(body, schema), [], name)
+        push, heartbeat = load_schema('push_payload.schema.json'), load_schema('heartbeat.schema.json')
+        self.assertEqual(heartbeat['properties']['instance'], push['properties']['instance'])
+
     def test_retry_after_header(self):
         # Value: protects=Retry-After parsed, clamped to [0, MAX_RETRY_AFTER], junk ignored; fails_when=clamp/parse removed so server can stall pushes or crash; why_new=_retry_after untested; seam=none; no_claim=HTTP-date form
         class _Resp:
