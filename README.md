@@ -1,7 +1,7 @@
 # Fivenines Monitoring for Odoo
 
-`fivenines_monitoring` brings the equivalent of the Odoo.sh "Monitor" tab to any Odoo 16, 17, 18
-or 19, Community or Enterprise, Odoo.sh or self-hosted. Add the module, paste a Fivenines
+`fivenines_monitoring` brings the equivalent of the Odoo.sh "Monitor" tab to any Odoo 16, 17, 18,
+19 or 20, Community or Enterprise, Odoo.sh or self-hosted. Add the module, paste a Fivenines
 enrollment key, done: every minute the instance pushes its own metrics to Fivenines over HTTPS.
 Nothing to open on the firewall, no agent to run.
 
@@ -9,7 +9,9 @@ Nothing to open on the firewall, no agent to run.
   SQL time per request. Each database counts only its own requests, even on a multi-database
   server.
 - **Errors**: ERROR and CRITICAL counts, grouped by fingerprint (logger, message template,
-  exception type and origin). No customer data: message templates, never formatted messages.
+  exception type and origin), with the latest message and traceback of each group. Messages
+  and tracebacks can contain business data (a partner name, an order reference); turn them off
+  with "Send error messages" in Settings. Credentials are masked in them either way.
 - **Scheduled actions**: late, stuck, running and (Odoo 18+) failing crons.
 - **Database**: size, connections by state, longest transaction, server connection usage.
 - **System**: CPU, memory, disk, Odoo processes, with the real container limits from cgroup
@@ -26,7 +28,10 @@ Design and open questions: issue #1. The wire format is in [docs/api-contract.md
    `addons_path` in the Odoo config file (e.g. `/etc/odoo/odoo.conf`).
 2. Restart Odoo, then Apps > Update Apps List > search "Fivenines Monitoring" > Activate.
 3. Settings > Fivenines Monitoring: paste the enrollment key, Save. The first run (within a
-   minute) enrolls the instance. "Send now" pushes immediately.
+   minute) enrolls the instance. "Send now" pushes immediately. The key is used once: after the
+   enrollment it is deleted from the database, and the instance keeps only its own secret.
+4. If your organization approves new databases, the settings screen says "Waiting for approval
+   in Fivenines as <name>" until someone clicks Monitor (or Ignore) in Fivenines.
 
 ### Odoo.sh
 
@@ -41,6 +46,7 @@ and paste the key, in each branch (production, staging, development) you want to
 | Enrollment key | "Fivenines enrollment key" | `fivenines_enrollment_key` | `FIVENINES_ENROLLMENT_KEY` |
 | API URL (default `https://api.fivenines.io`) | "Fivenines API URL" (developer mode) | `fivenines_api_url` | `FIVENINES_API_URL` |
 | Pause this database | "Pause monitoring" | - | - |
+| Send error messages and tracebacks (default on) | "Send error messages" | - | - |
 | Allow plain `http://` API URLs (testing only) | - | `fivenines_allow_insecure_http = True` | `FIVENINES_ALLOW_INSECURE_HTTP` |
 | Keep counting requests with `log_level = warn` (default on) | - | `fivenines_capture_quiet_werkzeug` | `FIVENINES_CAPTURE_QUIET_WERKZEUG` |
 | Spool directory (default `<tmp>/fivenines-<uid>`) | - | `fivenines_spool_dir` | `FIVENINES_SPOOL_DIR` |
@@ -54,9 +60,10 @@ startup: it is harmless, Odoo keeps the value.
 
 ## How it works
 
-- A logging handler in every Odoo process counts the `werkzeug` access lines (status code and
-  Odoo's `perf_info`: SQL count, SQL time, other time) and the WARNING/ERROR/CRITICAL records,
-  per database (`threading.current_thread().dbname`).
+- A logging handler in every Odoo process counts the HTTP access lines (status code, SQL count,
+  SQL time, other time: the `werkzeug` lines with Odoo's `perf_info` up to Odoo 19, the
+  `odoo.http.server` lines of Odoo 20's own HTTP server) and the WARNING/ERROR/CRITICAL
+  records, per database (`threading.current_thread().dbname`).
 - Each process flushes its cumulative counters every 10 s to
   `<tmp>/fivenines-<uid>/<db>-<hash>/<pid>-<start>.json` (atomic rename).
 - A scheduled action ("Fivenines: push metrics", every minute) sums the files, subtracts what
@@ -64,13 +71,24 @@ startup: it is harmless, Odoo keeps the value.
   dead processes are removed after their last counters were delivered. When Fivenines cannot be
   reached nothing is lost: the next push covers the longer window. Retries back off up to 15 min.
 - The enrollment key is exchanged once for a per-instance secret, stored in
-  `ir.config_parameter` (administrators only). A fingerprint of where the database runs (name,
-  `database.uuid`, `web.base.url`, Odoo.sh stage) is checked on every run: a database copied under
-  another name or uuid enrolls as a new instance instead of reporting as the original. A
+  `ir.config_parameter` (administrators only); a key pasted in Settings is then deleted. Every
+  push also sends the URLs the database knows (`web.base.url` and the website domains), so
+  Fivenines can match existing uptime monitors.
+- A fingerprint of where the database runs (name, `database.uuid`, `web.base.url`, Odoo.sh
+  stage, neutralized or not) is checked on every run. A copy (another name or uuid, another
+  stage, a neutralized copy) announces itself to Fivenines with the secret it copied, and gets a
+  new secret for a new database, proposed for approval: it never reports as the original. A
   `web.base.url` change alone (Odoo rewrites it on admin logins) is reported to Fivenines, which
-  tells a second live copy apart. Odoo's neutralization also deletes the secret.
+  tells a second live copy apart.
+- Odoo's neutralization (Odoo.sh staging, `odoo-bin neutralize`) is respected: it turns the
+  push off and the module never turns it back on by itself. The copy's settings screen says
+  "This database is a neutralized copy: monitoring is off", and one click on "Turn it on"
+  starts it; the copy then announces itself as above.
+- Waiting for approval, the module keeps its secret, sends nothing that would pile up and checks
+  again every 15 minutes (or what Fivenines asks). "Ignored" in Fivenines is final: the module
+  stops, and "Re-enroll" with a key proposes the database again.
 - A refused secret (HTTP 401, e.g. revoked in Fivenines) stops the pushes; the module retries
-  once a day and never re-enrolls on its own. "Re-enroll" in Settings starts over.
+  once a day and never re-enrolls on its own. "Re-enroll" in Settings (with a key) starts over.
 - Secrets travel only in the `Authorization` header, over HTTPS, and are never logged.
 
 ## Odoo.sh notes
@@ -88,8 +106,11 @@ startup: it is harmless, Odoo keeps the value.
   workers' counters (the spool directory is local), and the cron runs on one of them at a time.
 - With `log_level = debug_sql` Odoo itself logs every SQL statement with its values, including
   the row that stores the secret. Do not run production at that level.
-- Error messages are sent as templates; messages formatted before logging are masked with
-  patterns (emails, URLs, numbers, quoted strings, ids), which cannot catch every shape of data.
+- Error messages and tracebacks are sent as logged (bounded: 2000 and 8000 characters) unless
+  "Send error messages" is off. Credentials in them (passwords and tokens in URLs, DSNs,
+  `Authorization` headers, `password=`/`api_key:` pairs, bearer tokens, JWTs, long hex keys) are
+  masked by patterns, which cannot recognize a secret in every shape (free text, an unnamed
+  value).
 
 ## Development
 
@@ -106,8 +127,8 @@ python3 tools/e2e_local.py --odoo-bin <odoo>/odoo-bin --python <venv>/bin/python
   --addons-path <odoo>/addons --db-user $USER
 ```
 
-CI (`.github/workflows/ci.yml`) runs the tests on Odoo 16, 17, 18 and 19 with the official Docker
-images and PostgreSQL 16. A manual `publish` job builds the `16.0`-`19.0` branches for the Odoo
+CI (`.github/workflows/ci.yml`) runs the tests on Odoo 16, 17, 18, 19 and 20 with the official Docker
+images and PostgreSQL 16. A manual `publish` job builds the `16.0`-`20.0` branches for the Odoo
 Apps Store (dry run by default).
 
 ## License

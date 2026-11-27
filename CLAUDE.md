@@ -19,7 +19,7 @@ Key routing rules:
 
 ## Testing
 
-- Module tests (Odoo test framework), Odoo 16, 17, 18 and 19 from source, in parallel:
+- Module tests (Odoo test framework), Odoo 16, 17, 18, 19 and 20 from source, in parallel:
   `ODOO_SRC=/home/paseo/odoo-src DB_USER=paseo tools/run_tests.sh`
   (`ODOO_SRC` holds `odoo-<version>/` checkouts and `venv-<version>/` virtualenvs.)
 - Tests live in `fivenines_monitoring/tests/` (`test_lib.py` pure units, `test_push.py`

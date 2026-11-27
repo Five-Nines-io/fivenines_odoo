@@ -30,11 +30,11 @@
 
 ### Keep previous_instance_id across a second Re-enroll
 
-**What:** Re-enroll takes `previous_instance_id` only from `fivenines.instance_id`; after a failed enrollment, a copy detection or a 409 (or on a neutralized copy, `fivenines.copied_from`) it is already gone.
+**What:** Re-enroll takes `previous_instance_id` only from `fivenines.instance_id`. Copies and 409s now keep the instance id until a new enrollment succeeds (#7), but a Re-enroll whose enrollment failed, followed by a second Re-enroll, has already forgotten it.
 
 **Why:** The link to the old instance is lost (contract section 3 says it is kept until an enrollment succeeds).
 
-**Context:** `models/fivenines_monitor.py` `_fn_run_locked` reenroll branch: `previous = params.get(P_INSTANCE) or pending_enroll.previous_instance_id or params.get(P_COPIED_FROM)`.
+**Context:** `models/fivenines_monitor.py` `_fn_run_locked` reenroll branch: `previous = params.get(P_INSTANCE) or (state.get('pending_enroll') or {}).get('previous_instance_id')`.
 
 **Effort:** S
 **Priority:** P2
@@ -44,7 +44,7 @@
 
 **What:** `pending_enroll` and `next_attempt_at` live in the host-local `state.json`, while the secret is per database.
 
-**Why:** On several nodes, or a staging host refreshed nightly under the same name, a stale or missing state changes the enrollment reason or delays a neutralized copy.
+**Why:** On several nodes, or a staging host refreshed nightly under the same name, a stale or missing state changes the enrollment reason. (Copies no longer depend on it: they are detected from the fingerprint stored in the database, #7.)
 
 **Context:** store `pending_enroll` in `ir.config_parameter` (written rarely), or drop it when the database has neither secret nor fingerprint.
 
@@ -52,16 +52,28 @@
 **Priority:** P3
 **Depends on:** None
 
-### Server-wide key moved the push URL of existing enrollments
+### A failing copy announcement retries every minute
 
-**What:** With a key from odoo.conf/env, the Settings API URL is now ignored for pushes too, also for a secret issued by that URL.
+**What:** A copy announces itself before any backoff (so it never waits for the original's schedule), but that also skips the backoff of its own failed announcements.
 
-**Why:** An install enrolled at a Settings URL with a server-wide key pushes to another endpoint after upgrade (401, then daily retry). The Settings field gives no hint that it is ignored.
+**Why:** While Fivenines answers 5xx or times out, each copy sends one `/enroll` per minute instead of backing off to 15 min.
 
-**Context:** store the URL (or its level) with the secret at enrollment and pin only enrollment requests; show "ignored" in Settings.
+**Context:** `_fn_run_locked`: keep the copy's backoff keyed by its fingerprint digest in `state.json` and honor it when `copy_of` is set.
 
 **Effort:** S
 **Priority:** P3
+**Depends on:** None
+
+### Settings: say when the API URL field is ignored
+
+**What:** With a key from odoo.conf/env, the Settings API URL is not used (enrollment goes to the server-wide URL; a secret goes to the URL that issued it, `fivenines.endpoint`). The field gives no hint.
+
+**Why:** An administrator may change a field that has no effect.
+
+**Context:** `views/res_config_settings_views.xml`, `models/res_config_settings.py`.
+
+**Effort:** S
+**Priority:** P4
 **Depends on:** None
 
 ### Counters dropped during a revoked hold
@@ -82,7 +94,7 @@
 
 **What:** Pre-formatted messages are masked by patterns; some shapes pass: an apostrophe in prose pairs with a value's opening quote ("Can't find partner 'John Smith'"), psycopg2 "Failing row contains (...)", unquoted names, a message with args whose template was partly pre-formatted (f-string + %s).
 
-**Why:** The README promises no customer data; it documents the limit, but these are common Odoo error shapes.
+**Why:** Error messages are now sent by default (#6), so this only matters with "Send error messages" off, where the module still promises to send templates only; these are common Odoo error shapes.
 
 **Context:** `lib/collector.py` `_MASKS`, `log_fingerprint`. Options: mask every template (also with args); mask parenthesized lists; send only logger/location/exception type when there is no lazy template. Long messages (> 2000 chars) keep only the text before the first quote (decision D8): safe, but less diagnostic, and a root cause can split into two fingerprints around 2000 chars.
 
@@ -147,3 +159,6 @@
 **Depends on:** an Odoo.sh project with admin rights
 
 ## Completed
+
+- Server-wide key moved the push URL of existing enrollments: a secret is now sent to the API URL that issued it (`fivenines.endpoint`). (fivenines_odoo #7)
+- Neutralized copies: `neutralize.sql` is gone; a neutralized copy keeps its secret, stays off until "Turn it on" and announces itself with the copied secret. (fivenines_odoo #7)
