@@ -207,8 +207,14 @@ Server notes:
   already exists, answer that one (after a `conflict`, whose copy differs from the original by
   its place only, the same copy is the one with the same full fingerprint): an ignored copy stays ignored (410), a pending one
   gets its token back.
-- With the enrollment key, whether a new database starts `monitored` (201) or `pending` (202) is
-  the organization's policy.
+- With the enrollment key:
+  - `reason` `fingerprint_changed` or `conflict` (a copy, e.g. one whose copied secret got a
+    401 and fell back to a configured key, possibly server-wide): **always pending (202)**, never
+    monitored without a click: a copy is proposed, never added (nor billed). `copy_of` is
+    `previous_instance_id` when that database belongs to the key's organization (otherwise the
+    proposal has no `copy_of`).
+  - `first_enrollment` and `manual`: monitored (201), unless the organization approves new
+    databases (its policy: pending, 202).
 - Dedup (optional, mirrors `host_for_dedup`): a `first_enrollment` whose fingerprint equals an
   active instance of the same organization may get that instance back with a rotated token.
   This covers a module that lost its parameters. Never dedup `fingerprint_changed`, `conflict`
@@ -650,4 +656,5 @@ Example bodies, valid against the schemas and kept so by the module's tests, liv
   adopts another place on silence (rule 3 removed): it proposes it, and a move is never
   guessed; failed copy announcements back off; rule 1 adopts only from a place stable over the
   accepted pushes it has (up to 3); a paused heartbeat (`kind: "heartbeat"`) every 15 minutes;
-  canonical example bodies next to the schemas.
+  canonical example bodies next to the schemas; a key enrollment of a copy (`fingerprint_changed`
+  or `conflict`) is always pending.

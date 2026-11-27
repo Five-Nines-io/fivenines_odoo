@@ -146,6 +146,7 @@ class StubState:
 
 COPY_COMPONENTS = ('database', 'database_uuid', 'odoo_stage', 'neutralized')
 STABLE_PUSHES = 3  # contract s5 rule 1
+COPY_REASONS = ('fingerprint_changed', 'conflict')  # contract s3: always pending
 
 
 def _copy_components(components):
@@ -386,6 +387,13 @@ class Handler(BaseHTTPRequestHandler):
                 entry = st.enrollment_keys.get(credential)
                 if not entry or entry['revoked']:
                     status = 401
+                elif body.get('reason') in COPY_REASONS:
+                    # contract s3: a copy is proposed, never added, even with a
+                    # (possibly server-wide) key: pending, linked to the database
+                    # it was copied from when that one is in the key's organization
+                    # (the stub has one organization)
+                    previous = st.instances.get(body.get('previous_instance_id') or '')
+                    inst, created, status = self._new_instance(body, 'pending', previous=previous), True, None
                 else:
                     inst, created, status = self._new_instance(body, st.new_policy), True, None
         if status == 401:

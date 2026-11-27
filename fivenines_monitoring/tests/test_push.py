@@ -712,9 +712,16 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(self.run_push()['result'], 'no_key')
         self.assertEqual(len(self.stub.state.requests), n, 'still the same copy')
         fm.icp_set(self.icp, fm.P_KEY, self.key)
+        original = [i for i in self.stub.state.instances.values() if i['revoked']][0]['instance_id']
+        # a copy is proposed, never added, even through a key (contract s3)
+        self.assertEqual(self.run_push()['result'], 'pending')
+        record_id = fm.icp_get(self.icp, fm.P_INSTANCE)
+        record = self.stub.state.instances[record_id]
+        self.assertEqual((record['credential'], record['reason'], record['state'], record['copy_of']),
+                         ('enrollment_key', 'fingerprint_changed', 'pending', original))
+        requests.post(self.stub.url + '/_stub/accept', json={'instance_id': record_id}, timeout=5)
+        self.expire_backoff()
         self.assertEqual(self.run_push()['result'], 'pushed')
-        record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
-        self.assertEqual((record['credential'], record['reason']), ('enrollment_key', 'fingerprint_changed'))
 
     def test_copy_key_fallback_never_goes_to_the_stored_endpoint(self):
         # Value: protects=when a copy's secret is refused, the enrollment key goes to the URL of its own level, never to fivenines.endpoint (a database parameter an admin can edit, or that a restored dump carries); fails_when=a tenant admin points the endpoint at their host, answers 401, and receives the organization's key; why_new=review of revision 2 (security, red team, adversarial); seam=a second stub plays the foreign endpoint; no_claim=TLS
@@ -725,16 +732,36 @@ class TestFingerprint(FiveninesCase, TransactionCase):
             fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
             fm.icp_set(self.icp, fm.P_KEY, self.key)
             out = self.run_push()
-            self.assertEqual(out['result'], 'pushed', out)
+            self.assertEqual(out['result'], 'pending', out)  # a copy: proposed (contract s3)
             self.assertEqual([r['path'] for r in other.state.requests], ['enroll'],
                              'only the copied secret went to the stored endpoint')
             instance = fm.icp_get(self.icp, fm.P_INSTANCE)
             self.assertEqual(self.stub.state.instances[instance]['credential'], 'enrollment_key')
             self.assertEqual(fm.icp_get(self.icp, fm.P_ENDPOINT), self.stub.url)
+            requests.post(self.stub.url + '/_stub/accept', json={'instance_id': instance}, timeout=5)
+            self.expire_backoff()
+            self.assertEqual(self.run_push()['result'], 'pushed')
             self.assertEqual(self.stub.state.pushes[-1]['instance_id'], instance,
                              'the new secret is pushed to the API that issued it')
         finally:
             other.stop()
+
+    def test_stub_key_enrollment_of_a_copy_is_proposed(self):
+        # Value: protects=an enrollment with a key (possibly server-wide) whose reason says it is a copy lands pending, linked to its original, while first enrollments and Re-enroll stay monitored; fails_when=a copy that fell back to a key is added and billed without a click; why_new=lead (founder rule "a copy is proposed, never added"); seam=enroll bodies built from the module's; no_claim=the real server
+        self.run_push()
+        original = fm.icp_get(self.icp, fm.P_INSTANCE)
+        body = json.loads(json.dumps(self.stub.state.enroll_bodies[-1]))
+        client = fn_client.Client(self.stub.url, 'test')
+        for reason, previous, code, copy_of in (('fingerprint_changed', original, 202, original),
+                                                ('conflict', original, 202, original),
+                                                ('fingerprint_changed', 'odi_elsewhere', 202, None),
+                                                ('first_enrollment', None, 201, None),
+                                                ('manual', original, 201, None)):
+            r = client.enroll(self.key, dict(body, reason=reason, previous_instance_id=previous))
+            self.assertEqual(r.status, code, (reason, r.data))
+            record = self.stub.state.instances[r.data['instance_id']]
+            self.assertEqual((record['state'], record['copy_of']),
+                             ('pending' if code == 202 else 'monitored', copy_of), reason)
 
     def test_key_pasted_after_enrollment_is_kept_until_used(self):
         # Value: protects=a key pasted to Re-enroll a revoked database survives a Send now (only the key an enrollment already used is dropped); fails_when=Send now erases the new key and Re-enroll answers no_key; why_new=review of revision 2 (testing, adversarial); seam=enrolled_at moved back (one test transaction); no_claim=a real rollback
