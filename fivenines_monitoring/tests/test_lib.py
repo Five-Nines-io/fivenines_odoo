@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 
+from unittest.mock import patch
+
 from odoo.tests.common import BaseCase, tagged
 
 from ..lib import client as fn_client
@@ -188,6 +190,24 @@ class TestCollector(BaseCase):
         self.assertEqual(len(fps), 2, 'the two pre-formatted variants share one fingerprint')
         templates = sorted(e['message_template'] for e in fps.values())
         self.assertIn('Order %s failed', templates)  # a real template is kept as is
+
+    def test_masking_is_bounded_on_huge_tokens(self):
+        # Value: protects=one ERROR log carrying a huge token (base64, JWT, hex dump) cannot stall logging: the masks only ever see a bounded prefix; fails_when=mask_values runs over the whole message (quadratic: 50k chars ~5 s, 1 MB ~35 min, GIL and handler lock held); why_new=adversarial + performance review (pass 2); seam=none; no_claim=regex complexity on the prefix itself
+        # Regression proof - fails at HEAD: yes (masks fed 1,080,010 chars; an in-thread deadline cannot even fire, re holds the GIL) - passes at base: unavailable (ecosystem) - passes after fix: yes
+        token = ('a1b2c3.d4e5_' * 90000)  # ~1 MB, no '@', no space
+        record = logging.LogRecord('odoo.http', logging.ERROR, '/x/odoo/http.py', 1, 'bad token ' + token, None, None)
+        seen = []
+        real = fn_collector.mask_values
+
+        def spy(text):
+            seen.append(len(text))
+            return real(text[:2000])  # the spy bounds its own work, so a red run fails fast
+
+        with patch.object(fn_collector, 'mask_values', spy):
+            fp, info = fn_collector.log_fingerprint(record)
+        self.assertTrue(seen)
+        self.assertLessEqual(max(seen), 2000)
+        self.assertLessEqual(len(info['message_template']), 300)
 
     def test_prefork_master_is_ignored(self):
         # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork

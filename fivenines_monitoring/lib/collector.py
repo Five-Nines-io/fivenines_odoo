@@ -109,9 +109,16 @@ def _short_path(path):
 # Masks for messages that were formatted BEFORE logging (f-strings,
 # `_logger.error('x %s' % v)`, `_logger.error(str(e))`, Werkzeug 1.x lines):
 # there is no template, so values are blanked out instead. Order matters.
+# Only this many characters are masked: the fingerprint uses the first 500
+# and the template the first 300. Bounding the input keeps a huge token (a
+# base64 blob in str(e)) from stalling the logging thread, which holds the
+# handler lock while emit() runs.
+MAX_MASKED = 2000
 _MASKS = (
-    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
-    (re.compile(r'\b[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
+    # the look-behinds start a match only at the beginning of a run, so a long
+    # run without '@' or '://' is scanned once, not once per position
+    (re.compile(r'(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
+    (re.compile(r'(?<![\w+.-])[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
     (re.compile(r'([?&][^=\s&]+)=[^&\s]*'), r'\1=?'),  # query strings
     (re.compile(r'=\([^)]*\)'), '=(?)'),            # psycopg2: Key (email)=(x)
     (re.compile(r'"[^"]*"'), '"?"'),
@@ -139,7 +146,7 @@ def log_fingerprint(record):
     template = record.msg if isinstance(record.msg, str) else type(record.msg).__name__
     template = strip_ansi(template).strip()
     if not record.args:
-        template = mask_values(template)
+        template = mask_values(template[:MAX_MASKED])
     exc_type = None
     origin = None
     if record.exc_info and record.exc_info[0] is not None:
