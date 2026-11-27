@@ -9,6 +9,8 @@ Machine-readable schemas (JSON Schema 2020-12, the subset the stub validates):
 
 - `fivenines_monitoring/tests/schemas/enroll_request.schema.json`
 - `fivenines_monitoring/tests/schemas/push_payload.schema.json`
+- `fivenines_monitoring/tests/schemas/heartbeat.schema.json`
+- example bodies: `fivenines_monitoring/tests/schemas/examples/*.json`
 
 When this document and a schema disagree, the schema wins. Fix both in the same PR.
 
@@ -216,6 +218,9 @@ Server notes:
 ## 4. Push: `POST /odoo/v1/collect`
 
 One per minute per instance, from the cron, with `Authorization: Bearer <instance token>`.
+Two kinds of body share this endpoint: a metrics push (`kind: "metrics"`, below; a body
+without `kind` is a metrics push) and, while monitoring is paused in Odoo, a paused heartbeat
+(`kind: "heartbeat"`, "Paused heartbeat" below, `heartbeat.schema.json`).
 
 ### Counters and gauges
 
@@ -254,6 +259,7 @@ wiped). The counters are correct for the window, but nothing before it was count
 | Field | Type | Meaning |
 |---|---|---|
 | `schema_version` | int | `1` |
+| `kind` | string | `metrics`. |
 | `sent_at` | float | When the payload was built. |
 | `stream_id` | string | See above. |
 | `seq` | int >= 1 | See above. |
@@ -405,6 +411,39 @@ Read with Odoo's own cursor (no extra connection), excluding the module's own jo
 | `odoo_processes` | `{count, rss_bytes, cpu_usage_percent}` for the Odoo master and all its children. CPU is a percentage of ALL host cores. |
 | `sample_interval_seconds` | Time since the previous sample (for the CPU percentages). |
 
+### Paused heartbeat
+
+While "Pause monitoring" is on in Odoo, the module sends no metrics. Instead, every 15 minutes
+(`every_seconds`, 900) it sends a small body to `/odoo/v1/collect` so Fivenines shows Paused
+instead of firing "stopped sending":
+
+```json
+{
+  "schema_version": 1,
+  "kind": "heartbeat",
+  "state": "paused",
+  "sent_at": 1764240000.123,
+  "paused_since": 1764236400.5,
+  "every_seconds": 900,
+  "instance": { "...": "the push payload's instance object, fingerprint_change null" }
+}
+```
+
+- No counters, no `stream_id`/`seq`, no window, no gauges. The server must not apply the 409
+  rule to it, adopt its fingerprint, nor touch the metrics streams; it records "paused, last
+  heard at".
+- The server shows **Paused** while the last heartbeat is newer than the last metrics push and
+  younger than 3 x `every_seconds`, and holds the "stopped sending" alert meanwhile. If the
+  heartbeats stop too, it reads it as not receiving, as usual.
+- Answers: `200` (`{"status": "ok", "state": "paused"}`), and like a push: `202` pending,
+  `410` ignored, `401` revoked (the module records these statuses). Anything else: the module
+  tries again at the next heartbeat, never sooner.
+- Only the database the secret belongs to sends it: a copy (other copy components than the
+  stored fingerprint) stays silent, and a revoked or ignored database sends nothing unless an
+  administrator clicks "Send now", which also sends one at once.
+- Unpausing resumes metrics pushes at the next minute with a fresh baseline
+  (`window.baseline_reset: true`, a new `stream_id`): nothing of the paused period is sent.
+
 ### Responses
 
 | Status | Meaning | Module behaviour |
@@ -454,12 +493,18 @@ instance, the fingerprint and the identity of the last accepted push: `instance.
 `process.pid` and `process.started_at`. When a push carries a fingerprint different from the
 stored one:
 
-1. the same identity AND the same `stream_id` over the last 3 accepted pushes (the same running
-   server changed its URL): adopt it. When fewer than 3 pushes were accepted, all of them must
-   match; with none, adopt (nobody else used the token). One matching push is not enough: a
-   PostgreSQL-level copy with the same fingerprint (same name, uuid and URL) is accepted
-   alongside production until its fingerprint differs, and it may well be the last pusher when
-   its administrator logs in and Odoo rewrites its `web.base.url`;
+1. the server looks at the accepted pushes it has for the instance, up to the last 3, and
+   adopts the change when EVERY one of them shares the current pusher's identity and
+   `stream_id` (the same running server changed its URL):
+   - 0 accepted pushes: adopt (nobody else used the token);
+   - 1 or 2, all from the current pusher's identity and stream: adopt, so a fresh install
+     whose administrator logs in during the first minutes (Odoo rewrites `web.base.url`) never
+     becomes a false copy;
+   - any mismatch in that window: rule 2.
+
+   One matching push is not enough: a PostgreSQL-level copy with the same fingerprint (same
+   name, uuid and URL) is accepted alongside production until its fingerprint differs, and it
+   may well be the last pusher when its administrator logs in;
 2. otherwise, **answer 409, whatever the time since the last accepted push**. The module that
    gets it announces itself with the token (`reason: "conflict"`), and the server always
    creates a new pending instance for it: a copy is proposed, never added. The server never
@@ -528,6 +573,7 @@ After a retryable failure (`404`, `5xx`, `400`/`413`/`422`, timeout, connection 
 | 6 | +8 min |
 | 7 and more | +15 min (cap) |
 
+Paused: one heartbeat every 15 minutes, whatever its answer (section 4).
 `429` uses `Retry-After`; `402`/`403` wait 1 hour; `401` waits 24 hours; `202` (pending) waits
 `retry_after` (default 15 min, 5 min to 6 h); `410` (ignored) stops; `409` announces the copy at
 once. A copy announces itself without waiting for the original's backoff; a failed announcement
@@ -541,7 +587,7 @@ unless the Odoo processes die AND their spool files are wiped before the next su
 |---|---|
 | `ir.config_parameter` | `fivenines.enrollment_key` (if pasted in Settings, deleted once an enrollment succeeds), `fivenines.api_url`, `fivenines.paused`, `fivenines.error_messages_off`, `fivenines.instance_secret`, `fivenines.instance_id`, `fivenines.endpoint` (the API URL that issued the secret), `fivenines.fingerprint` (hash + components), `fivenines.enrolled_at`, `fivenines.status` (`pending` / `ignored` with the server's name, `revoked`, `enrollment_refused`, `copy_needs_key`), `fivenines.server_identity` (last acknowledged master pid + start time). Written rarely: every write invalidates the ORM caches of all workers. On Odoo 20.0 they go through the typed `get_str`/`set_str` API. |
 | `<tmp>/fivenines-<uid>/<db>-<hash8>/<pid>-<start>.json` | Cumulative counters of one Odoo process, flushed every 10 s and at exit (atomic rename). |
-| same dir, `state.json` | Acknowledged baselines, `stream` and `seq`, backoff, a pending enrollment reason, a pending `fingerprint_change`, last result. `state.lock` serializes pushes (flock). |
+| same dir, `state.json` | Acknowledged baselines, `stream` and `seq`, backoff, a pending enrollment reason, a pending `fingerprint_change`, `paused_since` and `last_heartbeat_at` while paused, last result. `state.lock` serializes pushes (flock). |
 
 `<hash8>` = sha1 of `db_host:db_port:dbname`, so two Odoo servers on one machine with the same
 database name do not mix. `<pid>-<start>` keeps a dead process's last counters from being
@@ -561,7 +607,8 @@ acknowledged; a live worker keeps its file however long it has been idle.
    `last_window_end`.
 3. Enrollment: section 3 (key or a copy's secret; 201 / 202 / 410 / 401 / 402 / 403,
    `hosts_registered_count`, `last_used_at`, uptime monitors matched on `urls`).
-4. Collect: authenticate by token (401), ignored (410), pending (202, store nothing),
+4. Collect: authenticate by token (401), ignored (410), pending (202, store nothing), a
+   paused heartbeat (`kind: "heartbeat"`: record it, 200, nothing else),
    subscription (402), 409 rule (section 5: never adopt another identity on silence alone),
    validate against the schema (422 with a short
    `message`), dedup by `(stream_id, seq)` (section 4), store, 200.
@@ -586,7 +633,10 @@ endpoints on loopback: `GET /_stub/state`, `POST /_stub/revoke {"instance_id"}`,
 `POST /_stub/accept {"instance_id"}` (Monitor a pending database),
 `POST /_stub/ignore {"instance_id"}` (Ignore it), `POST /_stub/policy {"new", "retry_after"}`
 (new databases start `monitored` or `pending`; the pending check interval),
-`POST /_stub/reset`.
+`POST /_stub/reset`. It records paused heartbeats in `heartbeats` (`paused_at` on the instance).
+
+Example bodies, valid against the schemas and kept so by the module's tests, live in
+`fivenines_monitoring/tests/schemas/examples/`: the server vendors them byte-identical.
 
 ## 11. Revisions
 
@@ -598,4 +648,6 @@ endpoints on loopback: `GET /_stub/state`, `POST /_stub/revoke {"instance_id"}`,
   endpoints; `instance.urls`; error messages and tracebacks by default with `logs.messages`,
   credentials always masked; a 409 is answered with a copy announcement; the 409 rule never
   adopts another place on silence (rule 3 removed): it proposes it, and a move is never
-  guessed; failed copy announcements back off.
+  guessed; failed copy announcements back off; rule 1 adopts only from a place stable over the
+  accepted pushes it has (up to 3); a paused heartbeat (`kind: "heartbeat"`) every 15 minutes;
+  canonical example bodies next to the schemas.

@@ -311,6 +311,97 @@ class TestErrors(FiveninesCase, TransactionCase):
         self.assertEqual(fm.icp_get(self.icp, fm.P_INSTANCE), first)
         self.assertFalse(fm.icp_get(self.icp, fm.P_STATUS))
 
+    def test_live_bodies_match_the_canonical_examples(self):
+        # Value: protects=the example bodies next to the schemas have the same structure as what the module sends (enroll with a key, a copy's announcement, a push, a paused heartbeat); fails_when=the module adds or drops a field and the examples the server vendors go stale; why_new=lead request (canonical fixtures); seam=none; no_claim=values
+        examples = os.path.join(os.path.dirname(__file__), 'schemas', 'examples')
+
+        def example(name):
+            with open(os.path.join(examples, name), encoding='utf-8') as f:
+                return json.load(f)
+
+        def same_shape(live, ref, path='$'):
+            if isinstance(live, dict) and isinstance(ref, dict):
+                self.assertEqual(sorted(live), sorted(ref), path)
+                for k in live:
+                    same_shape(live[k], ref[k], '%s.%s' % (path, k))
+            elif isinstance(live, list) and isinstance(ref, list) and live and ref:
+                same_shape(live[0], ref[0], path + '[0]')
+
+        self.run_push()
+        same_shape(self.stub.state.enroll_bodies[-1], example('enroll_with_key.json'))
+        same_shape(self.last_payload(), example('push_full.json'))
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        self.run_push()
+        same_shape(self.stub.state.enroll_bodies[-1], example('enroll_copy_with_secret.json'))
+        fm.icp_set(self.icp, fm.P_PAUSED, True)
+        out = self.run_push(trigger='manual', force=True)
+        self.assertEqual(out.get('heartbeat'), 'pending', out)  # the copy waits for approval
+        same_shape(self.stub.state.heartbeats[-1]['body'], example('heartbeat_paused.json'))
+
+    def test_paused_heartbeat(self):
+        # Value: protects=while paused, the module sends a slow heartbeat with no metrics (Fivenines shows Paused, not "stopped sending"), never from a copy, at once on Send now, and resumes with a fresh baseline so nothing of the paused period is sent; fails_when=a paused module is silent, sends metrics, heartbeats every minute, or a copy marks the original paused; why_new=#10; seam=state.json pace moved back; no_claim=the server's Paused display
+        self.run_push()
+        pushes = len(self.stub.state.pushes)
+        fm.icp_set(self.icp, fm.P_PAUSED, True)
+        out = self.run_push()
+        self.assertEqual((out['result'], out.get('heartbeat')), ('paused', 'sent'), out)
+        self.assertEqual(len(self.stub.state.heartbeats), 1)
+        body = self.stub.state.heartbeats[-1]['body']
+        self.assertEqual((body['kind'], body['state'], body['every_seconds']), ('heartbeat', 'paused', 900))
+        self.assertNotIn('http', body)
+        self.assertEqual(self.stub.state.schema_errors, [])
+        self.assertEqual(len(self.stub.state.pushes), pushes, 'no metrics while paused')
+        self.assertEqual(self.run_push().get('heartbeat'), None, 'one heartbeat per 15 minutes')
+        self.assertEqual(len(self.stub.state.heartbeats), 1)
+        state = self.state_file()
+        state['last_heartbeat_at'] -= 900
+        spool.write_json_atomic(os.path.join(self.spool_dir, spool.STATE_FILE), state)
+        self.assertEqual(self.run_push().get('heartbeat'), 'sent')
+        self.assertEqual(self.run_push(trigger='manual', force=True).get('heartbeat'), 'sent', 'Send now')
+        self.assertEqual(len(self.stub.state.heartbeats), 3)
+        # a copy of the paused database carries the secret but stays silent
+        uuid_ = fm.icp_get(self.icp, 'database.uuid')
+        fm.icp_set(self.icp, 'database.uuid', 'copied-%s' % secrets.token_hex(4))
+        self.assertIsNone(self.run_push(trigger='manual', force=True).get('heartbeat'))
+        self.assertEqual(len(self.stub.state.heartbeats), 3)
+        fm.icp_set(self.icp, 'database.uuid', uuid_)
+        # counted while paused, by a live process: not sent after the resume
+        self.fake_process_file(os.getpid(), COLLECTOR.started_at, requests_2xx=5)
+        fm.icp_set(self.icp, fm.P_PAUSED, False)
+        out = self.run_push()
+        self.assertEqual(out['result'], 'pushed', out)
+        payload = self.last_payload()
+        self.assertEqual(payload['kind'], 'metrics')
+        self.assertTrue(payload['window']['baseline_reset'])
+        self.assertEqual(payload['seq'], 1)
+        self.assertEqual(payload['http']['requests_by_status']['2xx'], 0)
+
+    def test_stub_rule1_fresh_install_adopts_the_first_url_change(self):
+        # Value: protects=a fresh install whose admin logs in during the first minutes (1 or 2 accepted pushes, same identity and stream) gets its URL change adopted, not a false copy; a mismatch inside the 3-push window is a 409; fails_when=rule 1 demands 3 pushes, or ignores a foreign push in the window; why_new=lead's rule-1 wording (revision 2); seam=pushes built from the module's payload; no_claim=the real server
+        self.run_push()
+        secret = fm.icp_get(self.icp, fm.P_SECRET)
+        record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
+        mine = json.loads(json.dumps(self.last_payload()))
+        client = fn_client.Client(self.stub.url, 'test')
+
+        def push(payload, seq, fingerprint):
+            payload = json.loads(json.dumps(payload))
+            payload['seq'], payload['instance']['fingerprint'] = seq, fingerprint
+            return client.push(secret, payload).status
+
+        # 1 accepted push, same place: adopted
+        self.assertEqual(len(record['recent_places']), 1)
+        self.assertEqual(push(mine, 2, 'a' * 64), 200)
+        self.assertEqual(record['fingerprint'], 'a' * 64)
+        # 2 accepted pushes, same place: adopted
+        self.assertEqual(push(mine, 3, 'b' * 64), 200)
+        self.assertEqual(record['fingerprint'], 'b' * 64)
+        # a foreign stream inside the window: 409 for a change, from anyone
+        other = dict(mine, stream_id='c' * 32)
+        self.assertEqual(push(other, 1, 'b' * 64), 200, 'same fingerprint: accepted')
+        self.assertEqual(push(mine, 4, 'd' * 64), 409)
+        self.assertEqual(record['fingerprint'], 'b' * 64)
+
     def test_reenroll_while_paused_forgets_nothing(self):
         # Value: protects=Re-enroll while paused keeps the secret and instance; fails_when=the reenroll branch runs before the pause check; why_new=state-machine finding SM2; seam=none; no_claim=UI button path (model call)
         self.run_push()

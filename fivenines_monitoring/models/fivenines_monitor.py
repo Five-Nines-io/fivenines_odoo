@@ -57,6 +57,7 @@ STUCK_THRESHOLD = 1800  # a cron still running 30 min after its due time is stuc
 MAX_CRON_ITEMS = 50
 HOLD_LONG = 3600        # 402 / 403: try again in an hour
 RETRY_REVOKED = 86400   # 401: try again once a day (heals a server-side mistake)
+HEARTBEAT_EVERY = 900   # paused: one heartbeat every 15 minutes (contract s4)
 WARN_EVERY = 900        # rate limit of our own warnings, per kind
 
 _last_warning = {}
@@ -470,7 +471,14 @@ class FiveninesMonitor(models.AbstractModel):
         if _truthy(params.get(P_PAUSED)):
             # checked first: a Re-enroll while paused must not forget anything
             self._fn_sweep(directory, state)
-            return {'result': 'paused'}
+            state.setdefault('paused_since', now)
+            return self._fn_heartbeat(state, params, now, force)
+        if state.pop('paused_since', None) is not None:
+            # unpaused: resume at once, counting from now (nothing of the paused
+            # period is sent)
+            state.pop('last_heartbeat_at', None)
+            if params.get(P_SECRET):
+                state.update(self._fn_fresh_baseline(directory, now))
         key, key_source = self._fn_enrollment_key(params)
         if reenroll:
             # Administrator asked to start over: this needs an enrollment key
@@ -588,6 +596,62 @@ class FiveninesMonitor(models.AbstractModel):
             # it (revoked, ignored, a copy that needs a key) and not yet used.
             self._fn_forget_settings_key(params)
         return self._fn_push(api_client, directory, state, params, secret, components, digest, now)
+
+    @api.model
+    def _fn_heartbeat(self, state, params, now, force):
+        """Paused: tell Fivenines at a slow pace, with no metrics (contract s4).
+
+        Only the database the secret belongs to sends it (a copy carries the
+        original's secret: it stays silent), and never while revoked or
+        ignored unless an administrator clicks Send now.
+        """
+        out = {'result': 'paused'}
+        secret = params.get(P_SECRET)
+        status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
+        if not secret or (status.get('state') in ('revoked', 'ignored') and not force):
+            return out
+        components, digest = self._fn_fingerprint()
+        stored = json.loads(params[P_FINGERPRINT]) if params.get(P_FINGERPRINT) else None
+        if not stored or copy_key(stored.get('components') or {}) != copy_key(components):
+            return out  # a copy (or no fingerprint yet): not this secret's database
+        if not force and now - state.get('last_heartbeat_at', 0) < HEARTBEAT_EVERY - 5:
+            return out
+        try:
+            api_url = fn_client.check_api_url(
+                params.get(P_ENDPOINT) or self._fn_api_url(params, self._fn_enrollment_key(params)[1]),
+                allow_insecure=_conf_bool('fivenines_allow_insecure_http',
+                                          'FIVENINES_ALLOW_INSECURE_HTTP', False))
+        except ValueError as e:
+            return dict(out, heartbeat='config_error', message=str(e))
+        body = {
+            'schema_version': SCHEMA_VERSION,
+            'kind': 'heartbeat',
+            'state': 'paused',
+            'sent_at': round(now, 3),
+            'paused_since': round(state.get('paused_since') or now, 3),
+            'every_seconds': HEARTBEAT_EVERY,
+            'instance': dict(self._fn_instance_info(components, digest),
+                             instance_id=params.get(P_INSTANCE), fingerprint_change=None),
+        }
+        result = fn_client.Client(api_url, self._fn_user_agent()).push(secret, body)
+        state['last_heartbeat_at'] = now  # success or not: the next one is a pace away
+        if result.ok:
+            if status.get('state') in ('revoked', 'ignored', 'pending'):
+                self._fn_store({P_STATUS: False})
+            return dict(out, heartbeat='sent', status=result.status)
+        if result.kind == fn_client.PENDING:
+            if status.get('state') != 'pending':
+                self._fn_store({P_STATUS: json.dumps({
+                    'state': 'pending', 'name': _server_name(result.data), 'at': int(now)})})
+            return dict(out, heartbeat='pending', status=result.status)
+        if result.kind == fn_client.IGNORED:
+            self._fn_ignored(state, result, now, components)
+            return dict(out, heartbeat='ignored', status=result.status)
+        if result.kind == fn_client.UNAUTHORIZED:
+            self._fn_store({P_STATUS: json.dumps({
+                'state': 'revoked', 'at': int(now), 'message': result.message})})
+            return dict(out, heartbeat='revoked', status=result.status)
+        return dict(out, heartbeat='failed', status=result.status, kind=result.kind)
 
     @api.model
     def _fn_after_enroll(self, api_client, directory, state, params, outcome, components,
@@ -921,6 +985,7 @@ class FiveninesMonitor(models.AbstractModel):
         http_block = stats.http_payload(agg, window_seconds, COLLECTOR.werkzeug_capture != 'disabled')
         payload = {
             'schema_version': SCHEMA_VERSION,
+            'kind': 'metrics',
             'sent_at': round(now, 3),
             'stream_id': state['stream'],
             'seq': (state.get('seq') or 0) + 1,
