@@ -142,6 +142,7 @@ class StubState:
 
 
 COPY_COMPONENTS = ('database', 'database_uuid', 'odoo_stage', 'neutralized')
+STABLE_PUSHES = 3  # contract s5 rule 1
 
 
 def _copy_components(components):
@@ -306,6 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             'revoked': False,
             'last_push_at': None,
             'last_identity': None,
+            'recent_places': [],  # (identity, stream_id) of the last accepted pushes
             'push_count': 0,
             'pending_checks': 0,
             'last_payload': None,
@@ -423,18 +425,22 @@ class Handler(BaseHTTPRequestHandler):
         fingerprint = body['instance']['fingerprint']
         process = body.get('process') or {}
         identity = (body['instance'].get('hostname'), process.get('pid'), process.get('started_at'))
+        place = [list(identity), body.get('stream_id')]
         with st.lock:
             status = None
             if fingerprint != inst['fingerprint']:
-                # contract s5: the same running server changed its URL (or no
-                # push was accepted yet) -> adopt; any other identity -> 409,
-                # whatever the silence: a copy is proposed, never added
-                last = inst.get('last_identity')
-                if last is None or identity == last:
+                # contract s5 rule 1: adopt a URL change only from a STABLE place:
+                # the same identity and stream_id over the last STABLE_PUSHES
+                # accepted pushes (all of them when fewer were accepted; none:
+                # nobody else used the token). Anything else -> 409, whatever
+                # the silence: a copy is proposed, never added.
+                recent = inst['recent_places'][-STABLE_PUSHES:]
+                if all(p == place for p in recent):
                     inst['fingerprint'] = fingerprint
                 else:
                     status = 409
             if status is None:
+                inst['recent_places'] = (inst['recent_places'] + [place])[-STABLE_PUSHES:]
                 inst['last_identity'] = identity
                 inst['last_push_at'] = now
                 inst['push_count'] += 1
