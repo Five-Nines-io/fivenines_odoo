@@ -124,38 +124,25 @@ _MASKS = (
     (re.compile(r'\b[0-9a-f]{8,}\b', re.I), '<hex>'),
     (re.compile(r'\d+(?:[.,:]\d+)*'), 'N'),
 )
-# for a message cut at MAX_MASKED only: a value whose closing delimiter was cut
-# off is masked up to the end (applied after _MASKS closed the complete pairs)
-# A quote mask applies only when that quote is left unpaired (odd count once
-# _MASKS turned the complete pairs into "?" / '?').
-_CUT_MASKS = (
-    (None, re.compile(r'=\([^)]*$'), '=(?'),
-    ('"', re.compile(r'"[^"]*$'), '"?'),
-    ("'", re.compile(r"'[^']*$"), "'?"),
-)
-
-
 def mask_values(text):
-    """Mask the values of a pre-formatted message (bounded: MAX_MASKED chars).
+    """Mask the values of a pre-formatted message.
 
-    The regexes are quadratic on long runs without a match; a bounded prefix
-    keeps the worst case to milliseconds. A token cut at the bound is dropped,
-    so the tail of a value never escapes its mask.
+    A message longer than MAX_MASKED is cut, and only its text before the first
+    quote or `=(` is kept: a value whose closing delimiter was cut off can then
+    never escape its mask (no quote pairing on cut text), and the regexes, which
+    are quadratic on long runs without a match, see a bounded input.
     """
     cut = len(text) > MAX_MASKED
     if cut:
         text = text[:MAX_MASKED]
-        # drop the token cut at the bound (linear: no regex)
-        last_space = max(text.rfind(' '), text.rfind('\n'), text.rfind('\t'))
-        text = text[:last_space + 1]
+        ends = [i for i in (text.find('"'), text.find("'"), text.find('=(')) if i >= 0]
+        if ends:
+            text = text[:min(ends)]
+        else:  # drop the token cut at the bound (linear: no regex)
+            text = text[:max(text.rfind(' '), text.rfind('\n'), text.rfind('\t')) + 1]
     for pattern, replacement in _MASKS:
         text = pattern.sub(replacement, text)
-    if not cut:
-        return text
-    for quote, pattern, replacement in _CUT_MASKS:
-        if quote is None or text.count(quote) % 2:
-            text = pattern.sub(replacement, text)
-    return text + ' [cut]'
+    return text + ' [cut]' if cut else text
 
 
 def log_fingerprint(record):

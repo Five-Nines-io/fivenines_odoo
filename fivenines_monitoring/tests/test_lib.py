@@ -217,18 +217,27 @@ class TestCollector(BaseCase):
         self.assertLessEqual(max(regexes_saw), 2000)
         self.assertTrue(seen)
         self.assertLessEqual(len(info['message_template']), 300)
-        # values cut at the bound never escape their mask (fix-check finding)
+        # values cut at the bound never escape their mask (fix-check and adversarial repros)
         mask = fn_collector.mask_values
-        self.assertEqual(mask('Bad payload "' + 'customer Jane ' * 300 + '" end'), 'Bad payload "? [cut]')
-        self.assertNotIn('xxx', mask("Webhook failed: '" + 'x' * 3000 + "'"))
-        cut = mask('"' + 'x' * 1983 + '" to jane.doe@corp.com and more ' + 'y' * 50)
+        pad = 'customer Jane Doe ' * 150
+        cases = {
+            'Bad payload "' + 'customer Jane ' * 300 + '" end': 'Bad payload  [cut]',
+            "Webhook failed: '" + 'x' * 3000 + "'": 'Webhook failed:  [cut]',
+            "Can't import \"O'Brien " + pad: 'Can [cut]',
+            "Partner doesn't match: Key (name)=(O'Brien " + pad: 'Partner doesn [cut]',
+            'Import failed: can\'t save "Jane Doe lives at Elm street, it\'s her ' + pad + '" end': 'Import failed: can [cut]',
+            'Partner match: Key (name)=(' + pad: 'Partner match: Key (name) [cut]',
+        }
+        for message, expected in cases.items():
+            self.assertEqual(mask(message), expected)
+            self.assertNotIn('Jane', mask(message))
+        cut = mask('order ' + 'x' * 1983 + ' to jane.doe@corp.com and more ' + 'y' * 50)
         self.assertNotIn('jane', cut)
-        self.assertTrue(cut.startswith('"?" to'), cut)  # a closed pair stays closed
         self.assertEqual(mask('a@b.com+c@d.com'), '<email><email>')
-        # a short message keeps its text after an apostrophe (no cut: closed pairs only)
+        self.assertEqual(mask('step 1.https://h/s?k=1'), 'step N.<url>')
+        # a short message keeps its text after an apostrophe (closed pairs only)
         self.assertEqual(mask("Record doesn't exist or has been deleted. (Record: res.partner(42,), User: 7)"),
                          "Record doesn't exist or has been deleted. (Record: res.partner(N,), User: N)")
-        self.assertEqual(mask('step 1.https://h/s?k=1'), 'step N.<url>')
 
     def test_prefork_master_is_ignored(self):
         # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork
