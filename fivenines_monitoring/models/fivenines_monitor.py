@@ -24,7 +24,7 @@ from odoo import SUPERUSER_ID, api, fields, models, release, tools
 from ..lib import client as fn_client
 from ..lib import spool, stats
 from ..lib import system as fn_system
-from ..lib.collector import COLLECTOR
+from ..lib.collector import COLLECTOR, access_logger_name
 
 _logger = logging.getLogger(__name__)
 
@@ -41,9 +41,15 @@ P_FINGERPRINT = 'fivenines.fingerprint'
 P_ENROLLED_AT = 'fivenines.enrolled_at'
 P_STATUS = 'fivenines.status'
 P_SERVER = 'fivenines.server_identity'
-P_COPIED_FROM = 'fivenines.copied_from'  # set by data/neutralize.sql
+P_ENDPOINT = 'fivenines.endpoint'        # the API URL the secret was issued by
+P_MESSAGES_OFF = 'fivenines.error_messages_off'
+SETTINGS_PARAMS = (P_KEY, P_PAUSED, P_API_URL, P_MESSAGES_OFF)
 STATE_PARAMS = (P_SECRET, P_INSTANCE, P_FINGERPRINT, P_ENROLLED_AT, P_STATUS, P_SERVER,
-                P_COPIED_FROM)
+                P_ENDPOINT)
+# a component change that means "another database" (a copy). base_url alone
+# does not: Odoo rewrites it on admin logins.
+COPY_COMPONENTS = ('database', 'database_uuid', 'odoo_stage', 'neutralized')
+MAX_URLS = 50
 
 LATE_THRESHOLD = 300    # a due cron not picked up for 5 min is late
 STUCK_THRESHOLD = 1800  # a cron still running 30 min after its due time is stuck
@@ -78,6 +84,44 @@ def _conf_bool(name, env_name, default):
     if value is None:
         return default
     return value.lower() in ('1', 'true', 'yes', 'on')
+
+
+def icp_get(icp, key):
+    """A parameter's raw string, or None (Odoo 20 typed API, or 16-19)."""
+    if hasattr(icp, 'get_str'):
+        value = icp.get_str(key, None)
+    else:
+        value = icp.get_param(key, None)
+    return value if value not in (False, '') else None
+
+
+def icp_set(icp, key, value):
+    """Set a parameter as a string; None / False / '' unsets it."""
+    value = None if value in (None, False, '') else str(value)
+    if hasattr(icp, 'set_str'):
+        icp.set_str(key, value)
+    else:
+        icp.set_param(key, value if value is not None else False)
+
+
+def urls_from(base_url, domains):
+    """base_url first, then each website domain (https:// when it has no
+    scheme), normalized like base_url, without duplicates."""
+    urls = [base_url] if base_url else []
+    for domain in domains:
+        value = (domain or '').strip()
+        if not value:
+            continue
+        if '://' not in value:
+            value = 'https://' + value
+        url = normalize_url(value)
+        if url and url not in urls:
+            urls.append(url)
+    return urls[:MAX_URLS]
+
+
+def _truthy(value):
+    return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def _key_hash(key):
@@ -128,7 +172,8 @@ class FiveninesMonitor(models.AbstractModel):
                 COLLECTOR.ignore_pid = os.getpid()
             COLLECTOR.register_db(self.env.cr.dbname, self._fn_spool_dir())
             COLLECTOR.install(force_werkzeug_info=_conf_bool(
-                'fivenines_capture_quiet_werkzeug', 'FIVENINES_CAPTURE_QUIET_WERKZEUG', True))
+                'fivenines_capture_quiet_werkzeug', 'FIVENINES_CAPTURE_QUIET_WERKZEUG', True),
+                access_logger=access_logger_name())
         except Exception:  # noqa: BLE001
             _logger.warning('Fivenines: could not install the request collector', exc_info=True)
 
@@ -167,10 +212,10 @@ class FiveninesMonitor(models.AbstractModel):
         fresh cursor too, or a second run in one transaction would enroll twice.
         """
         icp = self.env['ir.config_parameter'].sudo()
-        params = {k: icp.get_param(k) or None for k in (P_KEY, P_PAUSED, P_API_URL)}
+        params = {k: icp_get(icp, k) for k in SETTINGS_PARAMS}
         registry = self.env.registry
         if _testing() or (hasattr(registry, 'in_test_mode') and registry.in_test_mode()):
-            params.update({k: icp.get_param(k) or None for k in STATE_PARAMS})
+            params.update({k: icp_get(icp, k) for k in STATE_PARAMS})
             return params
         with registry.cursor() as cr:
             cr.execute('SELECT key, value FROM ir_config_parameter WHERE key IN %s', [STATE_PARAMS])
@@ -217,12 +262,25 @@ class FiveninesMonitor(models.AbstractModel):
         if _testing() or (hasattr(registry, 'in_test_mode') and registry.in_test_mode()):
             icp = self.env['ir.config_parameter'].sudo()
             for k, v in values.items():
-                icp.set_param(k, v)
+                icp_set(icp, k, v)
             return
         with registry.cursor() as cr:
             icp = api.Environment(cr, SUPERUSER_ID, {})['ir.config_parameter']
             for k, v in values.items():
-                icp.set_param(k, v)
+                icp_set(icp, k, v)
+
+    @api.model
+    def _fn_forget_settings_key(self, params):
+        """The enrollment key is used once: drop a key pasted in Settings.
+
+        Written on THIS transaction, not on a separate cursor: the Send now and
+        Re-enroll buttons save the settings (the key row) in this very
+        transaction, and a second connection writing that row would wait for
+        it forever. A key from odoo.conf or the environment stays where the
+        operator put it.
+        """
+        if params.get(P_KEY):
+            icp_set(self.env['ir.config_parameter'].sudo(), P_KEY, None)
 
     # ------------------------------------------------------------------
     # identity
@@ -232,9 +290,11 @@ class FiveninesMonitor(models.AbstractModel):
         icp = self.env['ir.config_parameter'].sudo()
         components = {
             'database': self.env.cr.dbname,
-            'database_uuid': icp.get_param('database.uuid') or None,
-            'base_url': normalize_url(icp.get_param('web.base.url')),
+            'database_uuid': icp_get(icp, 'database.uuid'),
+            'base_url': normalize_url(icp_get(icp, 'web.base.url')),
             'odoo_stage': os.environ.get('ODOO_STAGE') or None,
+            # set by Odoo's neutralization (16+): a neutralized database is a copy
+            'neutralized': _truthy(icp_get(icp, 'database.is_neutralized')),
         }
         digest = hashlib.sha256(json.dumps(components, sort_keys=True).encode()).hexdigest()
         return components, digest
@@ -256,6 +316,36 @@ class FiveninesMonitor(models.AbstractModel):
         except Exception:  # noqa: BLE001
             pid, started_at = os.getpid(), round(COLLECTOR.started_at, 2)
         return {'pid': pid, 'started_at': started_at, 'mode': mode}
+
+    @api.model
+    def _fn_urls(self, base_url):
+        """Every URL the database knows: web.base.url, then the website domains.
+
+        Fivenines matches existing uptime monitors on them. Not part of the
+        fingerprint: a website domain added later is not a copy.
+        """
+        domains = []
+        Website = self.env.get('website')
+        if Website is not None and 'domain' in Website._fields:
+            domains = [w['domain'] for w in Website.sudo().with_context(active_test=False).search_read(
+                [('domain', '!=', False)], ['domain'], limit=MAX_URLS)]
+        return urls_from(base_url, domains)
+
+    @api.model
+    def _fn_cron(self):
+        return self.env.ref('%s.ir_cron_fivenines_push' % MODULE, raise_if_not_found=False)
+
+    @api.model
+    def _fn_turn_on(self):
+        """Re-activate the push scheduled action (one click, by an administrator).
+
+        Odoo's neutralization deactivates every scheduled action of a copy; the
+        module never turns its own back on by itself.
+        """
+        cron = self._fn_cron()
+        if cron:
+            cron.sudo().write({'active': True, 'nextcall': fields.Datetime.now()})
+        return bool(cron)
 
     @api.model
     def _fn_module_version(self):
@@ -281,6 +371,7 @@ class FiveninesMonitor(models.AbstractModel):
             'database_uuid': components['database_uuid'],
             'base_url': components['base_url'],
             'odoo_stage': components['odoo_stage'],
+            'urls': self._fn_urls(components['base_url']),
             'odoo_version': release.version,
             'odoo_serie': release.serie,
             'odoo_version_info': list(release.version_info),
@@ -347,84 +438,122 @@ class FiveninesMonitor(models.AbstractModel):
     def _fn_run_locked(self, directory, state, trigger, force, reenroll=False):
         now = time.time()
         params = self._fn_params()
-        if (params.get(P_PAUSED) or '').lower() in ('true', '1'):
+        if _truthy(params.get(P_PAUSED)):
             # checked first: a Re-enroll while paused must not forget anything
             self._fn_sweep(directory, state)
             return {'result': 'paused'}
+        key, key_source = self._fn_enrollment_key(params)
         if reenroll:
-            # Administrator asked for a new enrollment: forget the secret (and a
-            # revoked / refused status). Our own copy of the params is updated
-            # too: this transaction cannot see the committed write.
+            # Administrator asked to start over: this needs an enrollment key
+            # (the old secret may be revoked or ignored). Without one, forget
+            # nothing. Our own copy of the params is updated too: this
+            # transaction cannot see the committed write.
+            if not key:
+                return {'result': 'no_key'}
             previous = params.get(P_INSTANCE)
             self._fn_forget(keep_status=False)
             params = dict(params, **{k: None for k in STATE_PARAMS})
             state.clear()
             state['pending_enroll'] = {'reason': 'manual', 'previous_instance_id': previous}
         status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
-        revoked = status.get('state') == 'revoked'
 
         components, digest = self._fn_fingerprint()
         secret = params.get(P_SECRET)
         stored = json.loads(params[P_FINGERPRINT]) if params.get(P_FINGERPRINT) else None
+        copy_of = None  # set when this database is a copy announcing itself
         if stored and stored.get('hash') != digest:
             old = stored.get('components') or {}
-            changed = sorted(k for k in components if components.get(k) != old.get(k))
-            if changed == ['base_url']:
-                # Odoo rewrites web.base.url on admin logins (unless
-                # web.base.url.freeze): a first login or an alias, not a copy.
-                # Adopt it, and flag it on every push until one is acknowledged;
-                # Fivenines tells a second live place apart (409, contract s5).
-                self._fn_store({P_FINGERPRINT: json.dumps({'hash': digest, 'components': components})})
-                state['fingerprint_change'] = 'base_url_changed'
+            changed = sorted(k for k in components
+                             if (components.get(k) or None) != (old.get(k) or None))
+            if any(k in COPY_COMPONENTS for k in changed):
+                # another database name, uuid, Odoo.sh stage, or a neutralized
+                # database: a copy. It announces itself with the secret it
+                # carries (contract s5); the secret, fingerprint and instance id
+                # are kept until a new enrollment succeeds.
+                copy_of = {'reason': 'fingerprint_changed', 'changed': changed,
+                           'previous_instance_id': params.get(P_INSTANCE)}
             else:
-                # another database name, database.uuid or Odoo.sh stage: a copy
-                _logger.info('Fivenines: instance location changed (%s), enrolling as a new instance',
-                             ', '.join(changed))
-                previous = params.get(P_INSTANCE)
-                secret = None
-                revoked = False
-                self._fn_forget(keep_status=False)
-                params = dict(params, **{k: None for k in STATE_PARAMS})
-                state.clear()
-                state['pending_enroll'] = {'reason': 'fingerprint_changed',
-                                           'previous_instance_id': previous}
+                if changed == ['base_url']:
+                    # Odoo rewrites web.base.url on admin logins (unless
+                    # web.base.url.freeze): a first login or an alias, not a
+                    # copy. Flag it on every push until one is acknowledged.
+                    state['fingerprint_change'] = 'base_url_changed'
+                # no change that matters (a new component, base_url): adopt
+                self._fn_store({P_FINGERPRINT: json.dumps({'hash': digest, 'components': components})})
+
+        if status.get('state') == 'ignored' and not force and not copy_of:
+            # Ignored in Fivenines: final. No automatic request at all; Send now
+            # asks again, Re-enroll (with a key) proposes the database anew.
+            self._fn_sweep(directory, state)
+            return {'result': 'ignored', 'name': status.get('name')}
 
         # after the fingerprint check: a copy must not wait for the original's backoff
-        if not force and state.get('next_attempt_at', 0) > now:
-            if revoked:
+        if not force and not copy_of and state.get('next_attempt_at', 0) > now:
+            if status.get('state') in ('revoked', 'pending'):
                 self._fn_sweep(directory, state)
-            return {'result': 'revoked' if revoked else 'backoff',
-                    'next_attempt_at': state['next_attempt_at']}
+            return {'result': status.get('state') if status.get('state') in ('revoked', 'pending')
+                    else 'backoff', 'next_attempt_at': state['next_attempt_at'],
+                    'name': status.get('name')}
 
-        _key, key_source = self._fn_enrollment_key(params)
+        # a secret goes back to the API that issued it (recorded at enrollment);
+        # an enrollment uses the URL of the key's level (_fn_api_url)
+        endpoint = params.get(P_ENDPOINT) if secret else None
         try:
-            api_url = self._fn_api_url(params, key_source)
+            api_url = endpoint or self._fn_api_url(params, key_source)
+            if endpoint:
+                api_url = fn_client.check_api_url(endpoint, allow_insecure=_conf_bool(
+                    'fivenines_allow_insecure_http', 'FIVENINES_ALLOW_INSECURE_HTTP', False))
         except ValueError as e:
             return {'result': 'config_error', 'message': str(e)}
         api_client = fn_client.Client(api_url, self._fn_user_agent())
 
+        if copy_of and secret:
+            outcome = self._fn_enroll(api_client, directory, state, params, components, digest,
+                                      copy_of['reason'], copy_of['previous_instance_id'], force,
+                                      credential=('instance_secret', secret),
+                                      changed=copy_of['changed'])
+            if outcome.get('result') != 'enrolled':
+                return outcome
+            return self._fn_after_enroll(api_client, directory, state, params, outcome,
+                                         components, digest, now)
+
         if not secret:
-            if revoked:  # a secret dropped by an older version on 401
+            if status.get('state') == 'revoked':  # a secret dropped by an older version
                 self._fn_sweep(directory, state)
                 return {'result': 'revoked'}
             # the reason survives a failed enrollment (state.json) until one succeeds
             pending = state.get('pending_enroll') or {}
-            reason, previous = pending.get('reason'), pending.get('previous_instance_id')
-            if not reason and params.get(P_COPIED_FROM):
-                reason, previous = 'neutralized_copy', params[P_COPIED_FROM]
             outcome = self._fn_enroll(api_client, directory, state, params, components, digest,
-                                      reason or 'first_enrollment', previous, force)
+                                      pending.get('reason') or 'first_enrollment',
+                                      pending.get('previous_instance_id'), force)
             if outcome.get('result') != 'enrolled':
                 if outcome.get('result') in ('no_key', 'enrollment_refused'):
                     self._fn_sweep(directory, state)
                 return outcome
-            secret = outcome.pop('secret')
-            params = dict(params, **{P_INSTANCE: outcome['instance_id'], P_SERVER: None,
-                                     P_STATUS: None})
+            return self._fn_after_enroll(api_client, directory, state, params, outcome,
+                                         components, digest, now)
 
+        if params.get(P_KEY) and params.get(P_ENDPOINT):
+            self._fn_forget_settings_key(params)  # used once (a run that rolled back)
+        return self._fn_push(api_client, directory, state, params, secret, components, digest, now)
+
+    @api.model
+    def _fn_after_enroll(self, api_client, directory, state, params, outcome, components,
+                         digest, now):
+        """After an enrollment: wait if it is pending, else push at once."""
+        params = dict(params, **{P_INSTANCE: outcome['instance_id'], P_SERVER: None,
+                                 P_STATUS: outcome.get('status_json'),
+                                 P_SECRET: outcome['secret'], P_ENDPOINT: api_client.base_url})
+        if outcome.get('state') == 'pending':
+            return {'result': 'pending', 'instance_id': outcome['instance_id'],
+                    'name': outcome.get('name'), 'next_attempt_at': state.get('next_attempt_at')}
+        return self._fn_push(api_client, directory, state, params, outcome['secret'],
+                             components, digest, now)
+
+    @api.model
+    def _fn_push(self, api_client, directory, state, params, secret, components, digest, now):
         if not state.get('acked') and 'last_ack_end' not in state:
             state.update(self._fn_fresh_baseline(directory, now))
-
         payload, commit = self._fn_build_payload(directory, state, params, components, digest, now)
         payload['instance']['fingerprint_change'] = state.get('fingerprint_change')
         result = api_client.push(secret, payload)
@@ -441,41 +570,71 @@ class FiveninesMonitor(models.AbstractModel):
 
     @api.model
     def _fn_enroll(self, api_client, directory, state, params, components, digest, reason,
-                   previous_instance, force):
-        key, source = self._fn_enrollment_key(params)
-        if not key:
-            return {'result': 'no_key'}
-        status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
-        if (status.get('state') == 'enrollment_refused' and status.get('key_hash') == _key_hash(key)
-                and not force):
-            return {'result': 'enrollment_refused'}
+                   previous_instance, force, credential=None, changed=None):
+        """POST /enroll with the enrollment key, or (a copy) with the secret it carries."""
+        if credential is None:
+            key, source = self._fn_enrollment_key(params)
+            if not key:
+                return {'result': 'no_key'}
+            status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
+            if (status.get('state') == 'enrollment_refused'
+                    and status.get('key_hash') == _key_hash(key) and not force):
+                return {'result': 'enrollment_refused'}
+            credential = ('enrollment_key', key)
+        else:
+            source = None
+        kind, value = credential
         body = {
             'schema_version': SCHEMA_VERSION,
+            'credential': kind,
             'reason': reason,
             'previous_instance_id': previous_instance,
+            'changed': changed or [],
             'key_source': source,
             'instance': self._fn_instance_info(components, digest),
         }
-        result = api_client.enroll(key, body)
+        result = api_client.enroll(value, body)
         now = time.time()
-        if result.ok:
+        if result.accepted:
             data = result.data
+            pending = result.kind == fn_client.PENDING
+            status_json = json.dumps({'state': 'pending', 'name': data.get('name'), 'at': int(now)}) \
+                if pending else False
             self._fn_store({
                 P_SECRET: data['token'],
                 P_INSTANCE: str(data['instance_id']),
                 P_FINGERPRINT: json.dumps({'hash': digest, 'components': components}),
                 P_ENROLLED_AT: str(int(now)),
-                P_STATUS: False,
+                P_STATUS: status_json,
                 P_SERVER: False,
-                P_COPIED_FROM: False,
+                P_ENDPOINT: api_client.base_url,
             })
+            if kind == 'enrollment_key' and source == 'settings':
+                self._fn_forget_settings_key(params)
             state.clear()
             state.update(self._fn_fresh_baseline(directory, now))
-            _logger.info('Fivenines: enrolled as instance %s', data['instance_id'])
-            return {'result': 'enrolled', 'instance_id': str(data['instance_id']), 'secret': data['token']}
+            if pending:
+                state['next_attempt_at'] = now + result.retry_after - 5
+            _logger.info('Fivenines: enrolled as instance %s%s', data['instance_id'],
+                         ' (waiting for approval)' if pending else '')
+            return {'result': 'enrolled', 'instance_id': str(data['instance_id']),
+                    'secret': data['token'], 'state': 'pending' if pending else 'monitored',
+                    'name': data.get('name'), 'status_json': status_json or None}
+        if result.kind == fn_client.IGNORED:
+            return self._fn_ignored(state, result, now)
         if result.kind == fn_client.UNAUTHORIZED:
+            if kind == 'instance_secret':
+                # the original's secret was revoked: a copy then needs a key
+                key, _source = self._fn_enrollment_key(params)
+                if key:
+                    return self._fn_enroll(api_client, directory, state, params, components,
+                                           digest, reason, previous_instance, force,
+                                           changed=changed)
+                self._fn_store({P_STATUS: json.dumps({
+                    'state': 'copy_needs_key', 'at': int(now), 'message': result.message})})
+                return {'result': 'no_key', 'status': result.status}
             self._fn_store({P_STATUS: json.dumps({
-                'state': 'enrollment_refused', 'key_hash': _key_hash(key), 'at': int(now),
+                'state': 'enrollment_refused', 'key_hash': _key_hash(value), 'at': int(now),
                 'message': result.message})})
             _warn('enroll401', 'Fivenines: the enrollment key was refused (HTTP 401). '
                   'Paste a valid key to retry.')
@@ -485,6 +644,17 @@ class FiveninesMonitor(models.AbstractModel):
               result.message or result.kind)
         return {'result': 'enroll_failed', 'kind': result.kind, 'status': result.status,
                 'message': result.message}
+
+    @api.model
+    def _fn_ignored(self, state, result, now):
+        """410: an administrator chose Ignore in Fivenines. Final for this database."""
+        name = (result.data or {}).get('name')
+        self._fn_store({P_STATUS: json.dumps({'state': 'ignored', 'name': name, 'at': int(now)})})
+        state['last_error'] = {'at': now, 'kind': result.kind, 'status': result.status,
+                               'message': result.message}
+        state.pop('next_attempt_at', None)
+        _logger.info('Fivenines: this database is ignored in Fivenines; nothing is sent any more')
+        return {'result': 'ignored', 'status': result.status, 'name': name}
 
     @api.model
     def _fn_schedule_retry(self, state, result, now):
@@ -532,6 +702,25 @@ class FiveninesMonitor(models.AbstractModel):
             if store:
                 self._fn_store(store)
             return dict(base, result='pushed', **commit['summary'])
+        if result.kind == fn_client.PENDING:
+            # Waiting for approval: Fivenines stored nothing. Drop what was
+            # counted (nothing accumulates for a later resend), keep the
+            # credentials, and only check again after retry_after.
+            for path in commit['delete']:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            state.update(self._fn_fresh_baseline(directory, now))
+            state['next_attempt_at'] = now + result.retry_after - 5
+            status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
+            name = (result.data or {}).get('name') or status.get('name')
+            if status.get('state') != 'pending' or status.get('name') != name:
+                self._fn_store({P_STATUS: json.dumps({'state': 'pending', 'name': name,
+                                                      'at': int(now)})})
+            return dict(base, result='pending', name=name, next_attempt_at=state['next_attempt_at'])
+        if result.kind == fn_client.IGNORED:
+            return dict(base, **self._fn_ignored(state, result, now))
         if result.kind == fn_client.UNAUTHORIZED:
             # Revoked in Fivenines: stop pushing. Never re-enroll on our own
             # (that would undo the revocation). The secret is kept and tried
@@ -546,17 +735,15 @@ class FiveninesMonitor(models.AbstractModel):
                   'next try in 24 h. Use "Re-enroll" in the Fivenines settings to start over.')
             return dict(base, result='revoked', message=result.message)
         if result.kind == fn_client.CONFLICT:
-            # The same secret is used from another place: we are a copy.
-            _logger.info('Fivenines: fingerprint conflict (HTTP 409), enrolling as a new instance')
-            previous = params.get(P_INSTANCE)
-            self._fn_forget(keep_status=False)
-            state.clear()
-            state['pending_enroll'] = {'reason': 'conflict', 'previous_instance_id': previous}
-            fresh = dict(params, **{k: None for k in STATE_PARAMS})
-            outcome = self._fn_enroll(api_client, directory, state, fresh, components, digest,
-                                      'conflict', previous, True)
+            # The same secret is in use from another place: we are a copy.
+            # Announce ourselves with that secret (no key needed): Fivenines
+            # mints a new secret for a new, proposed database.
+            _logger.info('Fivenines: fingerprint conflict (HTTP 409), announcing a copy')
+            outcome = self._fn_enroll(api_client, directory, state, params, components, digest,
+                                      'conflict', params.get(P_INSTANCE), True,
+                                      credential=('instance_secret', params.get(P_SECRET)))
             return dict(base, result='conflict', enroll=outcome.get('result'),
-                        instance_id=outcome.get('instance_id'))
+                        state=outcome.get('state'), instance_id=outcome.get('instance_id'))
         self._fn_schedule_retry(state, result, now)
         if result.kind == fn_client.REJECTED:
             _warn('rejected', 'Fivenines: push rejected (HTTP %s): %s', result.status, result.message)
@@ -569,7 +756,8 @@ class FiveninesMonitor(models.AbstractModel):
     @api.model
     def _fn_sweep(self, directory, state):
         """Delete files of dead processes while nothing is pushed (paused, no
-        key, key refused, revoked). Their counters would never be sent anyway."""
+        key, key refused, revoked, pending, ignored). Their counters would never
+        be sent anyway."""
         acked = state.get('acked') or {}
         for key, path, pid, start in spool.list_process_files(directory):
             doc = spool.read_json(path) or {}
@@ -680,7 +868,7 @@ class FiveninesMonitor(models.AbstractModel):
                             request_capture=COLLECTOR.werkzeug_capture) if server else None,
             'events': events,
             'http': http_block,
-            'logs': stats.logs_payload(agg),
+            'logs': stats.logs_payload(agg, messages=not _truthy(params.get(P_MESSAGES_OFF))),
             'crons': guard_sql('crons', self._fn_collect_crons),
             'database': guard_sql('database', self._fn_collect_database),
             'system': system_block,
@@ -847,12 +1035,18 @@ class FiveninesMonitor(models.AbstractModel):
         except Exception:  # noqa: BLE001
             state = {}
         status = json.loads(params[P_STATUS]) if params.get(P_STATUS) else {}
+        cron = self._fn_cron()
+        components, _digest = self._fn_fingerprint()
         return {
+            'name': status.get('name'),
+            'cron_active': bool(cron and cron.sudo().active),
+            'neutralized': components['neutralized'],
+            'messages': not _truthy(params.get(P_MESSAGES_OFF)),
             'key_source': source,
             'enrolled': bool(params.get(P_SECRET)),
             'instance_id': params.get(P_INSTANCE),
             'status': status.get('state'),
-            'paused': (params.get(P_PAUSED) or '').lower() in ('true', '1'),
+            'paused': _truthy(params.get(P_PAUSED)),
             'last_run': state.get('last_run'),
             'last_success': state.get('last_success'),
             'last_error': state.get('last_error'),

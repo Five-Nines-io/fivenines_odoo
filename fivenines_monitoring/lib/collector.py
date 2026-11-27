@@ -6,6 +6,10 @@
   handler sees the record, `record.perf_info` = "query_count query_time
   remaining_time" (seconds). Total time = query_time + remaining_time. The
   status code is `record.args[1]` of werkzeug's '"%s" %s %s' line.
+  Odoo 20.0 serves HTTP itself (h11, odoo/http/server.py): its access line is
+  an INFO record of the `odoo.http.server` logger carrying the status
+  (`http_response_status`) and the timings (`query_count`, `query_time`,
+  `remaining_time`) as record attributes.
 * WARNING / ERROR / CRITICAL records are counted per logger and fingerprint.
 * Only records whose thread serves a database that has the module installed
   are counted (`threading.current_thread().dbname`, set by odoo/http.py for
@@ -20,11 +24,13 @@ The handler never raises and never logs.
 import atexit
 import copy
 import hashlib
+import importlib.util
 import logging
 import os
 import re
 import threading
 import time
+import traceback
 
 from . import spool, stats
 
@@ -52,6 +58,17 @@ def parse_perf_info(perf_info):
         return None
 
 
+def perf_from_record(record):
+    """Odoo 20.0 access records carry the timings as attributes."""
+    try:
+        query_count = int(record.query_count)
+        query_time = float(record.query_time)
+        remaining = float(record.remaining_time)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return query_count, query_time, max(0.0, remaining)
+
+
 def perf_from_thread(thread):
     """Same maths as odoo.netsvc.PerfFilter, for when no perf_info was set."""
     try:
@@ -76,7 +93,13 @@ def _preformatted_status(record):
     return match.group(1) if match else None
 
 
+ACCESS_LOGGER_ODOO_HTTP = 'odoo.http.server'  # Odoo 20.0+
+
+
 def is_request_record(record):
+    if record.name == ACCESS_LOGGER_ODOO_HTTP:
+        return record.levelno == logging.INFO and type(
+            getattr(record, 'http_response_status', None)) is int
     if record.name != 'werkzeug' or record.levelno != logging.INFO or not isinstance(record.msg, str):
         return False
     if isinstance(record.args, tuple) and len(record.args) >= 3 and _WERKZEUG_REQUEST_MSG in record.msg:
@@ -85,6 +108,8 @@ def is_request_record(record):
 
 
 def request_status(record):
+    if record.name == ACCESS_LOGGER_ODOO_HTTP:
+        return record.http_response_status
     if record.args:
         raw = strip_ansi(record.args[1]).strip()
     else:
@@ -124,6 +149,69 @@ _MASKS = (
     (re.compile(r'\b[0-9a-f]{8,}\b', re.I), '<hex>'),
     (re.compile(r'\d+(?:[.,:]\d+)*'), 'N'),
 )
+# Credentials are masked in every text that leaves the instance, messages on
+# or off: they are not customer data, they are secrets. Every quantifier is
+# bounded (no quadratic backtracking) and the inputs are bounded too.
+MAX_MESSAGE = 2000
+MAX_TRACEBACK = 8000
+_SECRET_NAME = (r'[\w-]{0,40}(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|'
+                r'private[_-]?key|session[_-]?id|signature|credentials?)')
+_CREDENTIAL_MASKS = (
+    # user:password@ in any URL or DSN (postgres://, https://, smtp://...)
+    (re.compile(r'(\b[a-zA-Z][a-zA-Z0-9+.-]{0,30}://)[^\s/@:]{1,256}:[^\s/@]{1,256}@'), r'\1***:***@'),
+    # Authorization / Proxy-Authorization values
+    (re.compile(r'(?i)\b((?:proxy-)?authorization)(["\']?\s{0,4}[:=]\s{0,4}["\']?)'
+                r'((?:bearer|basic|token|digest)\s{1,4})?[^\s"\',;]{1,4096}'), r'\1\2\3***'),
+    # password=..., "api_key": "...", ?token=..., secret: ...
+    (re.compile(r'(?i)\b(' + _SECRET_NAME + r')(["\']?\s{0,4}[:=]\s{0,4}["\']?)([^\s"\',;&}]{1,4096})'),
+     r'\1\2***'),
+    (re.compile(r'(?i)\bbearer\s{1,4}[A-Za-z0-9._~+/=-]{8,4096}'), 'Bearer ***'),
+    (re.compile(r'\beyJ[\w-]{4,4096}\.[\w-]{4,4096}\.[\w-]{0,4096}'), '<jwt>'),
+    (re.compile(r'\b[0-9a-fA-F]{32,4096}\b'), '<hex>'),
+)
+
+
+def mask_credentials(text):
+    if not text:
+        return text
+    for pattern, replacement in _CREDENTIAL_MASKS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _bounded(text, limit, keep='head'):
+    """Cut to `limit` chars at a whitespace, so no credential is cut in half
+    (a half token would no longer match its mask)."""
+    if len(text) <= limit:
+        return text
+    if keep == 'tail':
+        text = text[-limit:]
+        first = min([i for i in (text.find(' '), text.find('\n')) if i >= 0] or [len(text)])
+        return '[cut] ' + text[first + 1:]
+    text = text[:limit]
+    last = max(text.rfind(' '), text.rfind('\n'), text.rfind('\t'))
+    return text[:last + 1] + '[cut]'
+
+
+def error_sample(record):
+    """The latest occurrence of an error group: message and traceback, bounded,
+    with credentials masked. Sent unless the database turned messages off."""
+    try:
+        message = record.getMessage()
+    except Exception:  # noqa: BLE001 - a broken %-format must not lose the sample
+        message = str(record.msg)
+    tb = record.exc_text or None
+    if tb is None and record.exc_info and record.exc_info[0] is not None:
+        tb = ''.join(traceback.format_exception(*record.exc_info))
+    if record.stack_info:
+        tb = (tb + '\n' if tb else '') + record.stack_info
+    return {
+        'message': mask_credentials(_bounded(strip_ansi(message), MAX_MESSAGE)),
+        'traceback': mask_credentials(_bounded(tb, MAX_TRACEBACK, keep='tail')) if tb else None,
+        'at': record.created,
+    }
+
+
 def mask_values(text):
     """Mask the values of a pre-formatted message.
 
@@ -158,6 +246,7 @@ def log_fingerprint(record):
     template = strip_ansi(template).strip()
     if not record.args:
         template = mask_values(template)
+    template = mask_credentials(template)
     exc_type = None
     origin = None
     if record.exc_info and record.exc_info[0] is not None:
@@ -180,6 +269,15 @@ def log_fingerprint(record):
         'location': location,
     }
     return fp, info
+
+
+def access_logger_name():
+    """The logger of the HTTP access line in the running Odoo."""
+    try:  # Odoo 20.0+: odoo.http is a package with its own server
+        found = importlib.util.find_spec('odoo.http.server_log') is not None
+    except (ImportError, ValueError):  # 16.0-19.0: odoo.http is a module
+        found = False
+    return ACCESS_LOGGER_ODOO_HTTP if found else 'werkzeug'
 
 
 class _DropBelow(logging.Filter):
@@ -211,7 +309,8 @@ class FiveninesHandler(logging.Handler):
             if not dbname or dbname not in self.collector.dbs:
                 return
             if is_request_record(record):
-                perf = parse_perf_info(getattr(record, 'perf_info', None)) or perf_from_thread(thread)
+                perf = (perf_from_record(record) if record.name == ACCESS_LOGGER_ODOO_HTTP
+                        else parse_perf_info(getattr(record, 'perf_info', None))) or perf_from_thread(thread)
                 if perf is None:
                     self.collector.on_request(dbname, request_status(record), None, 0, 0.0)
                 else:
@@ -228,7 +327,7 @@ class FiveninesHandler(logging.Handler):
                     self.collector.on_log(dbname, level, None, None)
                 else:
                     fp, info = log_fingerprint(record)
-                    self.collector.on_log(dbname, level, fp, info)
+                    self.collector.on_log(dbname, level, fp, info, error_sample(record))
         except Exception:  # noqa: BLE001 - monitoring must never break logging
             pass
 
@@ -304,22 +403,26 @@ class Collector:
     def unregister_db(self, dbname):
         self.dbs.pop(dbname, None)
 
-    def install(self, force_werkzeug_info=True):
-        """Attach the handler to the root logger, once per process."""
+    def install(self, force_werkzeug_info=True, access_logger='werkzeug'):
+        """Attach the handler to the root logger, once per process.
+
+        `access_logger` is the logger of the HTTP access line: `werkzeug` up
+        to Odoo 19.0, `odoo.http.server` from 20.0 (see access_logger_name).
+        """
         root = logging.getLogger()
         if self.handler is None or self.handler not in root.handlers:
             self.handler = FiveninesHandler(self)
             root.addHandler(self.handler)
         if self.werkzeug_capture is None:
-            self.werkzeug_capture = self.force_info('werkzeug') if force_werkzeug_info else (
-                'native' if logging.getLogger('werkzeug').isEnabledFor(logging.INFO) else 'disabled')
+            self.werkzeug_capture = self.force_info(access_logger) if force_werkzeug_info else (
+                'native' if logging.getLogger(access_logger).isEnabledFor(logging.INFO) else 'disabled')
         return self.handler
 
     def force_info(self, name):
         """Make sure INFO records of logger `name` are created.
 
         With `log_level = warn` (or `--log-handler werkzeug:WARNING`) Odoo sets
-        the werkzeug logger to WARNING, so no access record is ever created and
+        the access logger to WARNING, so no access record is ever created and
         request metrics would silently read 0. We lower that logger to INFO and
         add a filter to every other root handler so the log OUTPUT is unchanged:
         only our handler sees the extra records.
@@ -350,9 +453,9 @@ class Collector:
         with self._lock:
             stats.record_request(self._stats(dbname), code, total_ms, sql_queries, sql_time_ms)
 
-    def on_log(self, dbname, level, fingerprint, info):
+    def on_log(self, dbname, level, fingerprint, info, sample=None):
         with self._lock:
-            stats.record_log(self._stats(dbname), level, fingerprint, info)
+            stats.record_log(self._stats(dbname), level, fingerprint, info, sample)
 
     # -- flushing ---------------------------------------------------------
     def snapshot(self, dbname):

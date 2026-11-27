@@ -88,7 +88,8 @@
         "workers",
         "max_cron_threads",
         "instance_id",
-        "fingerprint_change"
+        "fingerprint_change",
+        "urls"
       ],
       "properties": {
         "fingerprint": {
@@ -102,7 +103,8 @@
             "database",
             "database_uuid",
             "base_url",
-            "odoo_stage"
+            "odoo_stage",
+            "neutralized"
           ],
           "additionalProperties": false,
           "properties": {
@@ -130,6 +132,10 @@
                 "null"
               ],
               "description": "ODOO_STAGE environment variable on Odoo.sh (production, staging, dev); null when self-hosted"
+            },
+            "neutralized": {
+              "type": "boolean",
+              "description": "database.is_neutralized (Odoo's neutralization, 16+): a neutralized database is a copy"
             }
           }
         },
@@ -212,6 +218,15 @@
             null
           ],
           "description": "set on every push from a base_url change until one is acknowledged"
+        },
+        "urls": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "description": "every URL the database knows: base_url first, then the website domains (website.domain), normalized like base_url; may be empty. Not part of the fingerprint"
         }
       }
     },
@@ -484,6 +499,7 @@
         "null"
       ],
       "required": [
+        "messages",
         "warning_count",
         "error_count",
         "critical_count",
@@ -491,6 +507,14 @@
         "fingerprints_truncated"
       ],
       "properties": {
+        "messages": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "description": "on (default): each group carries its latest message and traceback; off: the database turned error messages off, groups and counts only"
+        },
         "warning_count": {
           "type": "integer",
           "minimum": 0
@@ -516,7 +540,10 @@
               "message_template",
               "exception_type",
               "exception_origin",
-              "location"
+              "location",
+              "last_seen_at",
+              "last_message",
+              "last_traceback"
             ],
             "properties": {
               "fingerprint": {
@@ -541,7 +568,7 @@
               "message_template": {
                 "type": "string",
                 "maxLength": 300,
-                "description": "record.msg BEFORE argument substitution: no customer data"
+                "description": "record.msg BEFORE argument substitution (values masked when the message was formatted before logging); the grouping key"
               },
               "exception_type": {
                 "type": [
@@ -559,6 +586,30 @@
               "location": {
                 "type": "string",
                 "description": "where the log call is: path:line"
+              },
+              "last_seen_at": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Unix time of the latest occurrence"
+              },
+              "last_message": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 2100,
+                "description": "the latest occurrence's formatted message, credentials masked; null when messages are off"
+              },
+              "last_traceback": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 8100,
+                "description": "the latest occurrence's traceback (its last 8000 chars), credentials masked; null when messages are off or there is none"
               }
             }
           }

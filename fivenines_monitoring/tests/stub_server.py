@@ -17,6 +17,11 @@ Test-only endpoints (loopback clients only, never part of the contract):
     POST /_stub/revoke   {"instance_id": "..."}     revoke one instance token
     POST /_stub/revoke_key {"key": "..."}           revoke an enrollment key
     POST /_stub/fail     {"status": 503, "count": 2, "path": "collect"}
+    POST /_stub/accept   {"instance_id": "..."}     Monitor a pending database
+    POST /_stub/ignore   {"instance_id": "..."}     Ignore it (final)
+    POST /_stub/policy   {"new": "monitored"|"pending", "retry_after": 900}
+                         how a first enrollment with a key lands (copies are
+                         always pending), and the pending check interval
     POST /_stub/reset
 """
 
@@ -116,6 +121,8 @@ class StubState:
         self.pushes = []         # accepted payloads (all instances)
         self.requests = []       # (path, status, instance_id) log
         self.failures = []       # injected failures
+        self.new_policy = 'monitored'   # how a first enrollment with a key lands
+        self.retry_after = 900          # pending check interval sent to the module
         self.log_file = log_file
         self.enroll_schema = load_schema('enroll_request.schema.json')
         self.push_schema = load_schema('push_payload.schema.json')
@@ -234,6 +241,14 @@ class Handler(BaseHTTPRequestHandler):
                                     'path': body.get('path'),
                                     'retry_after': body.get('retry_after'),
                                     'delay': float(body.get('delay', 0))})
+            elif self.path in ('/_stub/accept', '/_stub/ignore'):
+                inst = st.instances.get(str(body.get('instance_id')))
+                if not inst:
+                    return self._send(404, {'status': 'error', 'message': 'no such instance'})
+                inst['state'] = 'monitored' if self.path == '/_stub/accept' else 'ignored'
+            elif self.path == '/_stub/policy':
+                st.new_policy = body.get('new', st.new_policy)
+                st.retry_after = int(body.get('retry_after', st.retry_after))
             elif self.path == '/_stub/reset':
                 st.instances.clear()
                 st.tokens.clear()
@@ -241,6 +256,8 @@ class Handler(BaseHTTPRequestHandler):
                 st.requests.clear()
                 st.failures.clear()
                 st.schema_errors.clear()
+                st.new_policy = 'monitored'
+                st.retry_after = 900
             else:
                 return self._send(404, {'status': 'error', 'message': 'not found'})
         self._send(200, {'status': 'ok'})
@@ -256,24 +273,65 @@ class Handler(BaseHTTPRequestHandler):
         self._send(f['status'], {'status': 'error', 'message': 'injected failure'}, headers)
         return True
 
+    def _new_instance(self, body, state, previous=None):
+        """Create a database record (caller holds the lock)."""
+        st = self.state
+        inst = body['instance']
+        instance_id = 'odi_%s' % secrets.token_hex(6)
+        token = secrets.token_hex(32)
+        name = '%s (%s)' % (inst.get('database'), inst.get('base_url'))
+        if previous:
+            name = 'Copy of %s: %s' % (previous['name'], name)
+        st.instances[instance_id] = {
+            'instance_id': instance_id,
+            'token': token,
+            'state': state,
+            'fingerprint': inst['fingerprint'],
+            'fingerprint_components': inst.get('fingerprint_components'),
+            'urls': inst.get('urls'),
+            'name': name,
+            'reason': body.get('reason'),
+            'credential': body.get('credential'),
+            'changed': body.get('changed'),
+            'previous_instance_id': body.get('previous_instance_id'),
+            'copy_of': previous['instance_id'] if previous else None,
+            'enrolled_at': time.time(),
+            'revoked': False,
+            'last_push_at': None,
+            'last_fingerprint_push_at': None,
+            'last_identity': None,
+            'push_count': 0,
+            'pending_checks': 0,
+            'last_payload': None,
+        }
+        st.tokens[token] = instance_id
+        return st.instances[instance_id]
+
+    def _enroll_answer(self, inst, created):
+        st = self.state
+        if inst['state'] == 'ignored':
+            self._record('enroll', 410, inst['instance_id'])
+            return self._send(410, {'status': 'error', 'code': 'ignored', 'name': inst['name'],
+                                    'message': 'This database is ignored in Fivenines'})
+        pending = inst['state'] == 'pending'
+        code = 202 if pending else (201 if created else 200)
+        body = {'status': 'pending' if pending else 'ok', 'state': inst['state'],
+                'instance_id': inst['instance_id'], 'token': inst['token'], 'name': inst['name']}
+        if pending:
+            body['retry_after'] = st.retry_after
+        self._record('enroll', code, inst['instance_id'])
+        return self._send(code, body)
+
     def _enroll(self):
+        """Contract s3. Bearer = an enrollment key, or the secret a copy carries."""
         if self._maybe_fail('enroll'):
             return
         st = self.state
-        key = _bearer(self.headers)
+        credential = _bearer(self.headers)
         body, err = self._body()
         if err:
             self._record('enroll', err)
             return self._send(err, {'status': 'error', 'message': 'invalid body'})
-        with st.lock:
-            entry = st.enrollment_keys.get(key)
-            if not entry or entry['revoked']:
-                status = 401
-            else:
-                status = None
-        if status:
-            self._record('enroll', 401)
-            return self._send(401, {'status': 'error', 'message': 'Invalid enrollment key'})
         errors = validate(body, st.enroll_schema) if st.enroll_schema else []
         if errors:
             with st.lock:
@@ -281,29 +339,38 @@ class Handler(BaseHTTPRequestHandler):
             self._record('enroll', 422)
             return self._send(422, {'status': 'error', 'message': 'invalid payload',
                                     'errors': errors[:20]})
-        inst = body['instance']
+        fingerprint = body['instance']['fingerprint']
         with st.lock:
-            instance_id = 'odi_%s' % secrets.token_hex(6)
-            token = secrets.token_hex(32)
-            st.instances[instance_id] = {
-                'instance_id': instance_id,
-                'token': token,
-                'fingerprint': inst['fingerprint'],
-                'fingerprint_components': inst.get('fingerprint_components'),
-                'name': '%s (%s)' % (inst.get('database'), inst.get('base_url')),
-                'reason': body.get('reason'),
-                'previous_instance_id': body.get('previous_instance_id'),
-                'enrolled_at': time.time(),
-                'revoked': False,
-                'last_push_at': None,
-                'last_fingerprint_push_at': None,
-                'push_count': 0,
-                'last_payload': None,
-            }
-            st.tokens[token] = instance_id
-        self._record('enroll', 201, instance_id)
-        self._send(201, {'status': 'ok', 'instance_id': instance_id, 'token': token,
-                         'name': st.instances[instance_id]['name']})
+            if body.get('credential') == 'instance_secret':
+                known = st.instances.get(st.tokens.get(credential))
+                if not known or known['revoked']:
+                    status = 401
+                elif known['fingerprint'] == fingerprint and body.get('reason') != 'conflict':
+                    status = 'same'   # the secret's own database, unchanged
+                    # (after a 409 the server already decided: always a copy)
+                else:
+                    # a copy of a known database (same organization): proposed,
+                    # never pushed as the original. Ignore is final for that
+                    # copy: the same copy announcing itself again stays ignored.
+                    for other in st.instances.values():
+                        if other.get('copy_of') == known['instance_id'] and other['fingerprint'] == fingerprint:
+                            inst, created = other, False
+                            break
+                    else:
+                        inst, created = self._new_instance(body, 'pending', previous=known), True
+                    status = None
+            else:
+                entry = st.enrollment_keys.get(credential)
+                if not entry or entry['revoked']:
+                    status = 401
+                else:
+                    inst, created, status = self._new_instance(body, st.new_policy), True, None
+        if status == 401:
+            self._record('enroll', 401)
+            return self._send(401, {'status': 'error', 'message': 'Invalid credential'})
+        if status == 'same':
+            return self._enroll_answer(known, False)
+        return self._enroll_answer(inst, created)
 
     def _collect(self):
         if self._maybe_fail('collect'):
@@ -320,6 +387,10 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self._record('collect', err, instance_id)
             return self._send(err, {'status': 'error', 'message': 'invalid body'})
+        if inst.get('state') == 'ignored':
+            self._record('collect', 410, instance_id)
+            return self._send(410, {'status': 'error', 'code': 'ignored', 'name': inst['name'],
+                                    'message': 'This database is ignored in Fivenines'})
         errors = validate(body, st.push_schema) if st.push_schema else []
         if errors:
             with st.lock:
@@ -327,6 +398,13 @@ class Handler(BaseHTTPRequestHandler):
             self._record('collect', 422, instance_id)
             return self._send(422, {'status': 'error', 'message': 'invalid payload',
                                     'errors': errors[:20]})
+        if inst.get('state') == 'pending':
+            # waiting for approval: nothing is stored
+            with st.lock:
+                inst['pending_checks'] += 1
+            self._record('collect', 202, instance_id)
+            return self._send(202, {'status': 'pending', 'state': 'pending', 'name': inst['name'],
+                                    'retry_after': st.retry_after})
         now = time.time()
         fingerprint = body['instance']['fingerprint']
         process = body.get('process') or {}
@@ -361,7 +439,7 @@ class Handler(BaseHTTPRequestHandler):
                 f.write(json.dumps({'instance_id': instance_id, 'received_at': now,
                                     'payload': body}) + '\n')
         self._record('collect', 200, instance_id)
-        self._send(200, {'status': 'ok'})
+        self._send(200, {'status': 'ok', 'state': 'monitored'})
 
 
 class StubServer:

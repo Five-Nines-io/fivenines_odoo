@@ -13,18 +13,21 @@
                     <button string="Save" type="object" name="execute" class="oe_highlight"/>
                     <button string="Send now" type="object" name="action_fivenines_push_now"/>
                     <button string="Re-enroll" type="object" name="action_fivenines_reenroll"
-                            confirm="This instance will enroll again and get a new secret. Continue?"/>
+                            confirm="This database will enroll again with the enrollment key and get a new secret. Continue?"/>
+                    <button string="Turn it on" type="object" name="action_fivenines_turn_on"/>
                 </header>
                 <sheet>
                     <div class="oe_title">
                         <h1>Fivenines Monitoring</h1>
                         <p>Pushes this database's metrics to Fivenines every minute.
-                           Paste the enrollment key of your Fivenines organization, then Save.</p>
+                           Paste the enrollment key of your Fivenines organization, then Save.
+                           The key is used once, then removed from this database.</p>
                     </div>
                     <group string="Enrollment" name="fivenines_enrollment">
                         <field name="fivenines_enrollment_key" password="True"/>
                         <field name="fivenines_key_source"/>
                         <field name="fivenines_paused"/>
+                        <field name="fivenines_send_error_messages"/>
                         <field name="fivenines_api_url" groups="base.group_no_one"
                                placeholder="https://api.fivenines.io"/>
                     </group>

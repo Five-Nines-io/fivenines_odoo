@@ -69,7 +69,9 @@ def record_request(stats, code, total_ms, sql_queries, sql_time_ms):
     http['sql_time_ms'] += sql_time_ms
 
 
-def record_log(stats, level, fingerprint, info):
+def record_log(stats, level, fingerprint, info, sample=None):
+    """Count a log record. `sample` ({message, traceback, at}) is the latest
+    occurrence of an error group; the cron sends it unless messages are off."""
     logs = stats['logs']
     if level in logs['levels']:
         logs['levels'][level] += 1
@@ -84,6 +86,10 @@ def record_log(stats, level, fingerprint, info):
         entry = dict(info, count=0)
         fps[fingerprint] = entry
     entry['count'] += 1
+    if sample:
+        entry['last_message'] = sample.get('message')
+        entry['last_traceback'] = sample.get('traceback')
+        entry['last_at'] = sample.get('at')
 
 
 def delta(current, baseline):
@@ -142,7 +148,11 @@ def merge_into(total, part):
     tl['overflow'] += pl.get('overflow', 0)
     for fp, entry in pl['fingerprints'].items():
         if fp in tl['fingerprints']:
-            tl['fingerprints'][fp]['count'] += entry['count']
+            mine = tl['fingerprints'][fp]
+            mine['count'] += entry['count']
+            if (entry.get('last_at') or 0) > (mine.get('last_at') or 0):  # keep the latest
+                for k in ('last_message', 'last_traceback', 'last_at'):
+                    mine[k] = entry.get(k)
         else:
             tl['fingerprints'][fp] = dict(entry)
     return total
@@ -208,12 +218,29 @@ def http_payload(agg, window_seconds, capture_enabled=True):
     }
 
 
-def logs_payload(agg, max_items=50):
-    """The `logs` block: level counts plus the top fingerprints by count."""
+LOG_ITEM_KEYS = ('count', 'logger', 'level', 'message_template', 'exception_type',
+                 'exception_origin', 'location')
+
+
+def logs_payload(agg, max_items=50, messages=True):
+    """The `logs` block: level counts plus the top fingerprints by count.
+
+    With messages on (the default, a settings switch), each group carries its
+    latest occurrence's message and traceback (credentials already masked by
+    the collector); off, only groups and counts.
+    """
     l = agg['logs']
     items = sorted(l['fingerprints'].items(), key=lambda kv: -kv[1]['count'])
-    top = [dict(entry, fingerprint=fp) for fp, entry in items[:max_items]]
+    top = []
+    for fp, entry in items[:max_items]:
+        item = {k: entry.get(k) for k in LOG_ITEM_KEYS}
+        item['fingerprint'] = fp
+        item['last_seen_at'] = round(entry['last_at'], 3) if entry.get('last_at') else None
+        item['last_message'] = entry.get('last_message') if messages else None
+        item['last_traceback'] = entry.get('last_traceback') if messages else None
+        top.append(item)
     return {
+        'messages': 'on' if messages else 'off',
         'warning_count': l['levels'].get('WARNING', 0),
         'error_count': l['levels'].get('ERROR', 0),
         'critical_count': l['levels'].get('CRITICAL', 0),

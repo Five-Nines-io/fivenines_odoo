@@ -2,7 +2,7 @@
 # Part of Fivenines Monitoring. License LGPL-3.
 # Run the module's tests on Odoo versions checked out from source, in parallel.
 #
-#   tools/run_tests.sh [16.0 17.0 18.0 19.0]
+#   tools/run_tests.sh [16.0 17.0 18.0 19.0 20.0]
 #
 # ODOO_SRC holds odoo-<version>/ (an odoo/odoo checkout) and venv-<version>/
 # (a virtualenv with its requirements). DB_HOST / DB_USER reach a PostgreSQL
@@ -22,7 +22,7 @@ for a in "$@"; do
     case "$a" in [0-9]*.0) versions="$versions $a" ;; esac
 done
 # shellcheck disable=SC2086
-set -- ${versions:-16.0 17.0 18.0 19.0}
+set -- ${versions:-16.0 17.0 18.0 19.0 20.0}
 
 run_one() {
     v=$1; major=${v%%.*}; db=fn_test_$major; log=$LOGDIR/odoo-$v.log

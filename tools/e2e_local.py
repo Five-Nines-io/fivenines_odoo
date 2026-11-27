@@ -10,7 +10,8 @@ Scenarios (each waits for real cron pushes, nothing is called directly):
   2. workers=2 (prefork), two databases (A and B) on ONE server, no dbfilter:
      each database must report only its own requests
   3. a copy of A (createdb -T, the copy keeps database.uuid and the secret):
-     the copy must re-enroll as a new instance
+     the copy announces itself with the copied secret and lands as a new,
+     pending instance that pushes nothing until it is accepted
 Also records whether Odoo's own duplicate gives the copy a new database.uuid.
 
 Uses throwaway databases (prefix fne2e_<serie>_) and drops them at the end.
@@ -144,6 +145,16 @@ class Run:
             time.sleep(3)
         raise RuntimeError('timeout waiting for %d pushes of %s' % (count, db))
 
+    def wait_copy(self, original_id, timeout=240):
+        """Wait until a copy of `original_id` announced itself to the stub."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for inst in self.stub_state()['instances']:
+                if inst.get('copy_of') == original_id:
+                    return inst
+            time.sleep(3)
+        raise RuntimeError('timeout waiting for a copy of %s' % original_id)
+
     def all_pushes(self):
         pushes = []
         with open(self.log_file) as f:
@@ -260,22 +271,44 @@ class Run:
         sh(['createdb', '-h', self.args.db_host, '-U', self.args.db_user, '-T', self.db_a, self.db_copy])
         copy_uuid = psql(self.args, self.db_copy, "SELECT value FROM ir_config_parameter WHERE key = 'database.uuid'")
         conf = self.write_conf(0, db_filter='^%s$' % self.db_copy)
-        t0 = time.time()
         self.start(conf, [self.db_copy])
-        pushes = self.wait_pushes(self.db_copy, 1, t0)
+        copy = self.wait_copy(a_id)
         self.stop()
-        copy_id = pushes[0]['instance_id']
-        state = self.stub_state()
-        inst = {i['instance_id']: i for i in state['instances']}
+        copy_id = copy['instance_id']
+        early = [p for p in self.all_pushes() if p['payload']['instance']['database'] == self.db_copy]
         self.report['scenarios']['copied_database'] = {
             'original_instance': a_id, 'copy_instance': copy_id,
-            'copy_reason': inst[copy_id]['reason'],
-            'copy_previous_instance_id': inst[copy_id]['previous_instance_id'],
+            'copy_state': copy['state'], 'copy_credential': copy['credential'],
+            'copy_reason': copy['reason'], 'copy_changed': copy['changed'],
+            'copy_previous_instance_id': copy['previous_instance_id'],
+            'pushes_stored_while_pending': len(early),
             'pg_copy_keeps_uuid': a_uuid == copy_uuid,
         }
         assert copy_id != a_id
-        assert inst[copy_id]['reason'] == 'fingerprint_changed'
-        assert inst[copy_id]['previous_instance_id'] == a_id
+        assert copy['state'] == 'pending', copy
+        assert copy['credential'] == 'instance_secret', copy
+        assert copy['reason'] == 'fingerprint_changed', copy
+        assert copy['previous_instance_id'] == a_id, copy
+        assert not early, 'a pending copy must not be stored'
+        # Monitor it in "Fivenines", then "Send now" on the copy
+        req = urllib.request.Request(self.stub_url + '/_stub/accept', method='POST',
+                                     data=json.dumps({'instance_id': copy_id}).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=5).close()
+        t1 = time.time()
+        code = ("out = env['fivenines.monitor']._fn_run(trigger='manual', force=True)\n"
+                "env.cr.commit()\nprint('FN_RESULT', out.get('result'))\n")
+        run = subprocess.run([self.args.python, self.args.odoo_bin, 'shell', '-d', self.db_copy, '--no-http',
+                              '--addons-path=%s,%s' % (self.args.addons_path, REPO),
+                              '--db_host=%s' % self.args.db_host, '--db_user=%s' % self.args.db_user,
+                              '-c', conf, '--log-level=warn'], input=code, capture_output=True, text=True)
+        pushes = self.wait_pushes(self.db_copy, 1, t1, timeout=60)
+        self.report['scenarios']['copied_database']['after_accept'] = {
+            'result': 'pushed' if 'FN_RESULT pushed' in run.stdout else run.stdout[-300:],
+            'instance_id': pushes[0]['instance_id'],
+            'baseline_reset': pushes[0]['payload']['window']['baseline_reset'],
+        }
+        assert pushes[0]['instance_id'] == copy_id
         # Odoo's own duplicate (database manager / odoo-bin db duplicate),
         # run from a shell on the OTHER database (no connection to the source)
         code = 'import odoo.service.db as d\nd.exp_duplicate_database(%r, %r)\n' % (self.db_a, self.db_dup)

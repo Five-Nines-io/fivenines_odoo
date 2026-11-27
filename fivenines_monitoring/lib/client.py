@@ -22,9 +22,16 @@ PUSH_PATH = '/odoo/v1/collect'
 # test harness compares the timeout with an int.)
 TIMEOUT = 10
 MAX_RETRY_AFTER = 3600
+# While waiting for approval: check every retry_after seconds (the server's
+# figure, default 900), bounded so a proposal is never left silent for long
+# (Fivenines drops a proposal silent for 3 days) nor polled every minute.
+PENDING_DEFAULT = 900
+PENDING_MIN, PENDING_MAX = 300, 21600
 
 # Result kinds, one per behaviour the module has (docs/api-contract.md#errors)
 OK = 'ok'
+PENDING = 'pending'                    # 202: waiting for approval (Monitor / Ignore)
+IGNORED = 'ignored'                    # 410: ignored in Fivenines, final
 UNAUTHORIZED = 'unauthorized'          # 401: secret revoked / key invalid
 PAYMENT_REQUIRED = 'payment_required'  # 402
 FORBIDDEN = 'forbidden'                # 403: instance limit / instance disabled
@@ -47,6 +54,11 @@ class Result:
     @property
     def ok(self):
         return self.kind == OK
+
+    @property
+    def accepted(self):
+        """2xx: monitored (OK) or waiting for approval (PENDING)."""
+        return self.kind in (OK, PENDING)
 
     def __repr__(self):
         return '<Result %s status=%s message=%r>' % (self.kind, self.status, self.message)
@@ -94,9 +106,19 @@ def classify(status, body, retry_after=None):
         message = body.get('message') or body.get('error')
         if message is not None:
             message = str(message)[:300]
+    data = body if isinstance(body, dict) else {}
     if 200 <= status < 300:
-        return Result(OK, status, body if isinstance(body, dict) else {}, message)
+        if status == 202 or data.get('state') == 'pending':
+            wait = data.get('retry_after', retry_after)
+            try:
+                wait = int(float(wait)) if wait is not None else PENDING_DEFAULT
+            except (TypeError, ValueError):
+                wait = PENDING_DEFAULT
+            return Result(PENDING, status, data, message,
+                          max(PENDING_MIN, min(PENDING_MAX, wait)))
+        return Result(OK, status, data, message)
     kind = {
+        410: IGNORED,
         401: UNAUTHORIZED,
         402: PAYMENT_REQUIRED,
         403: FORBIDDEN,
@@ -106,7 +128,7 @@ def classify(status, body, retry_after=None):
         422: REJECTED,
         429: RATE_LIMITED,
     }.get(status, RETRY)
-    return Result(kind, status, body if isinstance(body, dict) else {}, message, retry_after)
+    return Result(kind, status, data, message, retry_after)
 
 
 class Client:
@@ -138,9 +160,10 @@ class Client:
             data = None
         return classify(response.status_code, data, _retry_after(response))
 
-    def enroll(self, enrollment_key, payload):
-        result = self._post(ENROLL_PATH, enrollment_key, payload)
-        if result.ok and not (result.data.get('token') and result.data.get('instance_id')):
+    def enroll(self, credential, payload):
+        """credential: the enrollment key, or the secret a copy presents."""
+        result = self._post(ENROLL_PATH, credential, payload)
+        if result.accepted and not (result.data.get('token') and result.data.get('instance_id')):
             return Result(RETRY, result.status, message='enrollment answer without token/instance_id')
         return result
 

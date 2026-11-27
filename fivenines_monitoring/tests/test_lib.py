@@ -142,6 +142,26 @@ class TestCollector(BaseCase):
         self.assertEqual(snap['http']['status']['5xx'], 1)
         self.assertEqual(snap['http']['sql_queries'], 4)
 
+    def test_odoo_20_access_line(self):
+        # Odoo 20.0's own HTTP server logs through `odoo.http.server` with the
+        # status and timings as record attributes (odoo/http/server_log.py)
+        def access(status, level=logging.INFO):
+            record = logging.LogRecord('odoo.http.server', level, __file__, 1,
+                                       '127.0.0.1 - - "GET /web HTTP/1.1" %d' % status, (), None)
+            record.http_response_status = status
+            record.query_count, record.query_time, record.remaining_time = 7, 0.010, 0.030
+            return record
+        _Thread.run('db_a', lambda: (self.handler.emit(access(200)), self.handler.emit(access(502)),
+                                     self.handler.emit(access(200, logging.DEBUG))))  # [REQ]/[RES]
+        no_status = logging.LogRecord('odoo.http.server', logging.INFO, __file__, 1, 'x', (), None)
+        no_status.http_response_status = '-'  # no response was sent
+        self.assertFalse(fn_collector.is_request_record(no_status))
+        snap = self.collector.snapshot('db_a')
+        self.assertEqual((snap['http']['status']['2xx'], snap['http']['status']['5xx']), (1, 1))
+        self.assertEqual(snap['http']['sql_queries'], 14)
+        self.assertAlmostEqual(snap['http']['latency_sum_ms'], 80.0, places=3)
+        self.assertEqual(snap['http']['perf_missing'], 0)
+
     def test_request_without_perf_info(self):
         _Thread.run('db_a', lambda: self.handler.emit(_request_record(200, perf_info='- - -')))
         snap = self.collector.snapshot('db_a')
@@ -171,8 +191,14 @@ class TestCollector(BaseCase):
         self.assertEqual(by_template['Order %s failed']['count'], 2)
         self.assertEqual(by_template['Boom %s']['exception_type'], 'ValueError')
         self.assertIn('test_lib.py', by_template['Boom %s']['exception_origin'])
-        self.assertNotIn('S0001', json.dumps(fps))
-        self.assertNotIn('secret customer value', json.dumps(fps))
+        # the grouping key never carries values; the latest occurrence's message
+        # and traceback do, by design (#6), and the cron drops them when off
+        keys = json.dumps([{k: e[k] for k in ('message_template', 'location', 'exception_origin')}
+                           for e in fps.values()])
+        self.assertNotIn('S0001', keys)
+        self.assertNotIn('secret customer value', keys)
+        self.assertEqual(by_template['Order %s failed']['last_message'], 'Order S0002 failed')
+        self.assertIn('secret customer value', by_template['Boom %s']['last_traceback'])
 
     def test_preformatted_messages_are_masked(self):
         # Value: protects=messages formatted before logging (f-string, str(e)) leave the instance with values masked, and variants share one fingerprint; fails_when=record.msg is sent verbatim when there are no args; why_new=red-team RT4 (customer data in templates); seam=none; no_claim=every PII shape (regex masks)
@@ -184,7 +210,7 @@ class TestCollector(BaseCase):
             emit('duplicate key value: Key (email)=(mary@example.com) already exists, id 77'),
             emit('Order %s failed', ('S0001',))))
         fps = self.collector.snapshot('db_a')['logs']['fingerprints']
-        text = json.dumps(fps)
+        text = json.dumps([e['message_template'] for e in fps.values()])  # the grouping key
         for value in ('john@', 'mary@', '42', '77'):
             self.assertNotIn(value, text)
         self.assertEqual(len(fps), 2, 'the two pre-formatted variants share one fingerprint')
@@ -238,6 +264,34 @@ class TestCollector(BaseCase):
         # a short message keeps its text after an apostrophe (closed pairs only)
         self.assertEqual(mask("Record doesn't exist or has been deleted. (Record: res.partner(42,), User: 7)"),
                          "Record doesn't exist or has been deleted. (Record: res.partner(N,), User: N)")
+
+    def test_credentials_masked_in_messages_and_tracebacks(self):
+        # Value: protects=passwords, Authorization values, API keys, tokens in URLs/DSNs, JWTs and long hex secrets are masked in every text that leaves the instance, in bounded time; fails_when=a mask is removed or goes quadratic; why_new=#6 (messages on by default); seam=none; no_claim=every credential shape (deny-list)
+        m = fn_collector.mask_credentials
+        cases = {
+            'connect postgres://odoo:S3cret!@db:5432/prod failed': 'connect postgres://***:***@db:5432/prod failed',
+            'Authorization: Bearer abcdef0123456789xyz': 'Authorization: Bearer ***',
+            'POST /api?token=abc123&x=1': 'POST /api?token=***&x=1',
+            '{"api_key": "sk_live_123456", "password": "hunter2"}': '{"api_key": "***", "password": "***"}',
+            'jwt eyJhbGciOi.eyJzdWIiOi.sig123': 'jwt <jwt>',
+            'key 0123456789abcdef0123456789abcdef01234567': 'key <hex>',
+        }
+        for text, expected in cases.items():
+            self.assertEqual(m(text), expected)
+        try:
+            raise ValueError('cannot reach smtp://mailer:pw123@mail.example.com')
+        except ValueError:
+            import sys
+            record = logging.LogRecord('odoo.x', logging.ERROR, __file__, 1, 'Sync of %s failed: password=%s',
+                                       ('jane@example.com', 'hunter2'), sys.exc_info())
+        sample = fn_collector.error_sample(record)
+        self.assertEqual(sample['message'], 'Sync of jane@example.com failed: password=***')
+        self.assertIn('smtp://***:***@mail.example.com', sample['traceback'])
+        self.assertNotIn('pw123', sample['traceback'])
+        long_record = logging.LogRecord('odoo.x', logging.ERROR, __file__, 1, 'x ' * 5000, None, None)
+        self.assertLessEqual(len(fn_collector.error_sample(long_record)['message']), 2010)
+        for text in ('a' * 8000, 'password=' * 1000, ':' * 8000, 'x://' + 'a' * 7990):
+            m(text)  # bounded: each runs in well under a second (quadratic patterns would not)
 
     def test_prefork_master_is_ignored(self):
         # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Publish job: build the 16.0-19.0 branches without pushing"
+        description: "Publish job: build the 16.0-20.0 branches without pushing"
         type: boolean
         default: true
 
@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        odoo: ["16.0", "17.0", "18.0", "19.0"]
+        odoo: ["16.0", "17.0", "18.0", "19.0", "20.0"]
     services:
       postgres:
         image: postgres:16
@@ -92,7 +92,7 @@ jobs:
           name: odoo-${{ matrix.odoo }}-log
           path: odoo.log
 
-  # Publishes the module to the 16.0-19.0 branches the Odoo Apps Store reads,
+  # Publishes the module to the 16.0-20.0 branches the Odoo Apps Store reads,
   # changing only the version in __manifest__.py. Manual only, dry run by
   # default: nothing is pushed unless dry_run is unchecked on main.
   publish:
@@ -103,7 +103,7 @@ jobs:
       contents: write
     strategy:
       matrix:
-        serie: ["16.0", "17.0", "18.0", "19.0"]
+        serie: ["16.0", "17.0", "18.0", "19.0", "20.0"]
     steps:
       - uses: actions/checkout@v4
         with:

@@ -17,7 +17,7 @@ Monitoring (or put it in the Odoo config file / an environment variable), done.
 Nothing to open on the firewall: the instance pushes, Fivenines never pulls.
 """,
     # The series prefix (16.0., 17.0. ...) is added by Odoo at load time, and by
-    # the publish workflow on the 16.0-19.0 branches.
+    # the publish workflow on the 16.0-20.0 branches.
     'version': '1.0.0',
     'category': 'Administration',
     'author': 'Fivenines',
