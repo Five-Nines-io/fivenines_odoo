@@ -115,23 +115,31 @@ def _short_path(path):
 # handler lock while emit() runs.
 MAX_MASKED = 2000
 _MASKS = (
-    # the look-behinds start a match only at the beginning of a run, so a long
-    # run without '@' or '://' is scanned once, not once per position
-    (re.compile(r'(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
-    (re.compile(r'(?<![\w+.-])[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
+    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
+    (re.compile(r'\b[a-z][a-z0-9+.-]*://\S+', re.I), '<url>'),
     (re.compile(r'([?&][^=\s&]+)=[^&\s]*'), r'\1=?'),  # query strings
-    (re.compile(r'=\([^)]*\)'), '=(?)'),            # psycopg2: Key (email)=(x)
-    (re.compile(r'"[^"]*"'), '"?"'),
-    (re.compile(r"'[^']*'"), "'?'"),
+    # paired masks also match up to the end, for a value cut at MAX_MASKED
+    (re.compile(r'=\([^)]*(?:\)|$)'), '=(?)'),      # psycopg2: Key (email)=(x)
+    (re.compile(r'"[^"]*(?:"|$)'), '"?"'),
+    (re.compile(r"'[^']*(?:'|$)"), "'?'"),
     (re.compile(r'\b[0-9a-f]{8,}\b', re.I), '<hex>'),
     (re.compile(r'\d+(?:[.,:]\d+)*'), 'N'),
 )
 
 
 def mask_values(text):
+    """Mask the values of a pre-formatted message (bounded: MAX_MASKED chars).
+
+    The regexes are quadratic on long runs without a match; a bounded prefix
+    keeps the worst case to milliseconds. A token cut at the bound is dropped,
+    so the tail of a value never escapes its mask.
+    """
+    cut = len(text) > MAX_MASKED
+    if cut:
+        text = re.sub(r'\S*$', '', text[:MAX_MASKED])
     for pattern, replacement in _MASKS:
         text = pattern.sub(replacement, text)
-    return text
+    return text + ' [cut]' if cut else text
 
 
 def log_fingerprint(record):
@@ -146,7 +154,7 @@ def log_fingerprint(record):
     template = record.msg if isinstance(record.msg, str) else type(record.msg).__name__
     template = strip_ansi(template).strip()
     if not record.args:
-        template = mask_values(template[:MAX_MASKED])
+        template = mask_values(template)
     exc_type = None
     origin = None
     if record.exc_info and record.exc_info[0] is not None:

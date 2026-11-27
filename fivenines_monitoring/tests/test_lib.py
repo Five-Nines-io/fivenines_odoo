@@ -199,15 +199,32 @@ class TestCollector(BaseCase):
         seen = []
         real = fn_collector.mask_values
 
+        regexes_saw = []
+        real_sub = fn_collector._MASKS[0][0].sub
+
         def spy(text):
             seen.append(len(text))
-            return real(text[:2000])  # the spy bounds its own work, so a red run fails fast
+            return real(text)
 
-        with patch.object(fn_collector, 'mask_values', spy):
+        class Spy:  # what the first mask regex actually scans
+            def sub(self, repl, text):
+                regexes_saw.append(len(text))
+                return real_sub(repl, text[:2100])  # bounds a red run
+
+        masks = ((Spy(), fn_collector._MASKS[0][1]),) + fn_collector._MASKS[1:]
+        with patch.object(fn_collector, 'mask_values', spy), patch.object(fn_collector, '_MASKS', masks):
             fp, info = fn_collector.log_fingerprint(record)
+        self.assertLessEqual(max(regexes_saw), 2000)
         self.assertTrue(seen)
-        self.assertLessEqual(max(seen), 2000)
         self.assertLessEqual(len(info['message_template']), 300)
+        # values cut at the bound never escape their mask (fix-check finding)
+        mask = fn_collector.mask_values
+        self.assertEqual(mask('Bad payload "' + 'customer Jane ' * 300 + '" end'), 'Bad payload "?" [cut]')
+        self.assertNotIn('xxx', mask("Webhook failed: '" + 'x' * 3000 + "'"))
+        cut = mask('"' + 'x' * 1983 + '" to jane.doe@corp.com and more ' + 'y' * 50)
+        self.assertNotIn('jane', cut)
+        self.assertEqual(mask('a@b.com+c@d.com'), '<email><email>')
+        self.assertEqual(mask('step 1.https://h/s?k=1'), 'step N.<url>')
 
     def test_prefork_master_is_ignored(self):
         # Value: protects=the prefork master never counts nor starts the flusher thread before forking; fails_when=ignore_pid is not honoured; why_new=red-team RT12; seam=none; no_claim=a real fork
