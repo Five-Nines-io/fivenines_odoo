@@ -6,7 +6,7 @@
 
 **What:** Recognise "the same place" by more than (hostname, master pid, started_at) when a fingerprint changes.
 
-**Why:** Since the 409 rule never adopts another identity (revision 2, "a copy is proposed, never added"), a URL change in the first push after a restart, or seen from a second node (web + dedicated cron node), gets a 409 and becomes a proposal: one click ("probably a move: take its place") and a gap in the data.
+**Why:** Since the 409 rule never adopts another identity (revision 2, "a copy is proposed, never added"), a URL change in the first push after a restart, or seen from a second node (web + dedicated cron node), gets a 409 and becomes a proposal: the administrator picks "Replaces an existing database" (a move is never guessed), and the data has a gap.
 
 **Context:** docs/api-contract.md section 5, rule 1. Proof of continuity must not travel with a database copy: `events[].server_restart.previous` and `base_url_changed` do (they come from the database), so they cannot adopt. A candidate: the push's `stream_id` equals the last accepted one (it lives in the host-local `state.json`, not in the database, so it survives a process restart but not a restore elsewhere; not a VM snapshot either). The stub (`tests/stub_server.py`, collect) implements the current rule.
 
@@ -20,7 +20,9 @@
 
 **Why:** Both streams are accepted on one instance (dedup is per `stream_id`), so their counters add up. The contract says the server tells copies apart; for this case it does not.
 
-**Context:** answer 409 (or flag) when the fingerprint is equal but identity and `stream_id` differ from the last accepted push within 15 minutes; or correct the wording in section 5.
+Worse since revision 2 (review of PR #2, red team): such a copy's pushes interleave with production's, and when its admin logs in (Odoo rewrites `web.base.url`) while it was the last pusher, rule 1 ("same identity as the last accepted push: adopt") moves production's instance to the copy's fingerprint. Production then gets the 409 and lands as a pending copy: the takeover the founder's rule forbids.
+
+**Context:** answer 409 (or flag) when the fingerprint is equal but identity and `stream_id` differ from the last accepted push within 15 minutes; and adopt a fingerprint change under rule 1 only when the identity (and `stream_id`) was stable over several pushes, not just the last one. Needs the lead's decision (rule 1 "stays" per the revision 2 brief).
 
 **Effort:** S
 **Priority:** P2

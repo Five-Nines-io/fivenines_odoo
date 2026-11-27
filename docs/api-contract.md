@@ -169,10 +169,17 @@ enrollment (the issue's install flow, step 4), or attach the existing monitors w
   the body's `retry_after`, else the `Retry-After` header, else 900, bounded to 300..21600. The
   first push after the database is accepted carries `window.baseline_reset = true` and only
   counts from the previous check. "Send now" checks at once.
-- **Ignored** (`410`, `code: "ignored"`, on `/enroll` or `/collect`): final. The module keeps
-  its secret but makes no automatic request at all any more. "Send now" asks once (a database
-  un-ignored in Fivenines answers 200 and resumes); "Re-enroll" with a key proposes the database
-  anew. A copy of an ignored database still announces itself (its fingerprint changed).
+- **Ignored** (`410` with `code: "ignored"`, on `/enroll` or `/collect`): final. The module
+  keeps its secret but makes no automatic request at all any more. "Send now" asks once (a
+  database un-ignored in Fivenines answers 200 and resumes); "Re-enroll" with a key proposes
+  the database anew. The status is recorded with the fingerprint it applies to: an ignored copy
+  stays silent, while a new copy of an ignored database still announces itself (its fingerprint
+  changed). A `410` WITHOUT `code: "ignored"` (a retired path, a CDN) is a retryable failure,
+  never the final state; likewise a `202` without `state: "pending"` is not an acknowledgement.
+- **A copy whose copied secret is refused** (`401`) enrolls with the enrollment key at once,
+  sent to the URL of the key's own level (section 2), never to the endpoint that issued the
+  refused secret. Without a key it records `copy_needs_key` and makes no request until a key is
+  configured or "Send now" is clicked.
 - Both states show on the settings screen with the `name` the server returned.
 
 Server notes:
@@ -321,13 +328,16 @@ message longer than 2000 characters is cut: only its text before the first quote
 (without either, up to the last whitespace before the cut), masked the same way, and ends with
 ` [cut]`.
 
-The latest occurrence of each group is sent as is, with its values, when `messages` is `on`:
+The latest occurrence of each group is sent as is, with its values, when `messages` is `on`.
+The sample is taken at most once every 10 seconds per group (masking runs under the logging
+lock), and one push carries at most 200,000 characters of texts, given to the groups in count
+order; the groups past that budget go without texts.
 
 | Field | Meaning |
 |---|---|
 | `last_seen_at` | When the latest occurrence was logged. Sent in both modes. |
-| `last_message` | The formatted message (`record.getMessage()`), at most 2000 chars (cut at a whitespace, ends with `[cut]`). `null` when `messages` is `off`. |
-| `last_traceback` | The formatted traceback (and stack info), its LAST 8000 chars (starts with `[cut] `), `null` without one or when `messages` is `off`. |
+| `last_message` | The formatted message (`record.getMessage()`), at most 2000 chars (cut at a whitespace, ends with `[cut]`). `null` when `messages` is `off` or past the budget. |
+| `last_traceback` | The formatted traceback (and stack info), its LAST 8000 chars (starts with `[cut] `), `null` without one, when `messages` is `off` or past the budget. |
 
 Credentials are masked in both texts, always, whatever the switch: `user:password@` in URLs and
 DSNs becomes `***:***@`; the value of an `Authorization` header, of a secret-named key
@@ -335,8 +345,9 @@ DSNs becomes `***:***@`; the value of an `Authorization` header, of a secret-nam
 `session_id`, `signature`, `credentials`, also as a suffix: `smtp_password`, `x-api-key`) after
 `=` or `:` becomes `***`; `Bearer <token>` becomes `Bearer ***`; JWTs become `<jwt>`; hex runs of
 32+ chars (Fivenines secrets, most API keys) become `<hex>`. The masks are a deny-list with
-bounded quantifiers (linear time, applied after the length cut): a secret in another shape
-(free prose, an unnamed value) is not recognized.
+bounded quantifiers (linear time), applied BEFORE the length cut on a window a little larger
+than the bound, so a cut never separates a secret's name from its value: a secret in another
+shape (free prose, an unnamed value) is not recognized.
 
 ### `crons`
 
@@ -444,15 +455,12 @@ stored one:
    adopts a new place on its own, even after a silence: a production database restored on a
    test server while production is down must not take over production's identity.
 
-The server marks a proposal as a **probable move** when its original has been silent (no
-accepted push) for 15 minutes or more, at the announcement or later while the proposal waits.
-The UI then offers "probably a move: take its place": an explicit click makes the proposal the
-instance and revokes the original's token. Without that click both stay apart.
+A move is never guessed. The administrator who knows a proposal is a move says so on the
+proposal ("Replaces an existing database"); until then the two stay apart.
 
 Consequence: a URL change seen with another identity (the first push after a restart that also
-changed `web.base.url`, or from a second node) becomes a proposal too, marked as a probable
-move once the original stays silent. The module cannot tell those cases from a copy;
-the click resolves them.
+changed `web.base.url`, or from a second node) becomes a proposal too. The module cannot tell
+those cases from a copy; the administrator's choice on the proposal resolves them.
 
 `fingerprint_change` is informational (show "URL changed"); it never bypasses this rule. A copy
 whose fingerprint and identity both equal the original's cannot be told apart by anyone: it is
@@ -533,8 +541,8 @@ acknowledged; a live worker keeps its file however long it has been idle.
    subscription (402), 409 rule (section 5: never adopt another identity on silence alone),
    validate against the schema (422 with a short
    `message`), dedup by `(stream_id, seq)` (section 4), store, 200.
-5. UI: list instances under the organization, Monitor / Ignore a pending one, "probably a
-   move: take its place" on a proposal whose original is silent (section 5), revoke one, show
+5. UI: list instances under the organization, Monitor / Ignore a pending one, "Replaces an
+   existing database" on a proposal (section 5; never guessed), revoke one, show
    "copied from" via `previous_instance_id`, show `server_restart` as an event, not as a gap,
    show `last_message` / `last_traceback` per error group.
 6. Contract tests: post the stub's fixtures (`tests/schemas`) and the payloads the module's
@@ -565,5 +573,5 @@ endpoints on loopback: `GET /_stub/state`, `POST /_stub/revoke {"instance_id"}`,
   respected and "Turn it on" is one click); pending (`202`) and ignored (`410`) on both
   endpoints; `instance.urls`; error messages and tracebacks by default with `logs.messages`,
   credentials always masked; a 409 is answered with a copy announcement; the 409 rule never
-  adopts another place on silence (rule 3 removed): it proposes it, marked as a probable move;
-  failed copy announcements back off.
+  adopts another place on silence (rule 3 removed): it proposes it, and a move is never
+  guessed; failed copy announcements back off.
