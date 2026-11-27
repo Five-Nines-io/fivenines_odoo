@@ -454,8 +454,12 @@ instance, the fingerprint and the identity of the last accepted push: `instance.
 `process.pid` and `process.started_at`. When a push carries a fingerprint different from the
 stored one:
 
-1. same identity as the last accepted push (the same running server changed its URL): adopt it.
-   Also adopt it when the instance has no accepted push yet (nobody else used the token);
+1. the same identity AND the same `stream_id` over the last 3 accepted pushes (the same running
+   server changed its URL): adopt it. When fewer than 3 pushes were accepted, all of them must
+   match; with none, adopt (nobody else used the token). One matching push is not enough: a
+   PostgreSQL-level copy with the same fingerprint (same name, uuid and URL) is accepted
+   alongside production until its fingerprint differs, and it may well be the last pusher when
+   its administrator logs in and Odoo rewrites its `web.base.url`;
 2. otherwise, **answer 409, whatever the time since the last accepted push**. The module that
    gets it announces itself with the token (`reason: "conflict"`), and the server always
    creates a new pending instance for it: a copy is proposed, never added. The server never
@@ -472,6 +476,19 @@ those cases from a copy; the administrator's choice on the proposal resolves the
 `fingerprint_change` is informational (show "URL changed"); it never bypasses this rule. A copy
 whose fingerprint and identity both equal the original's cannot be told apart by anyone: it is
 treated as the same instance.
+
+### Limitation: multi-node Odoo (v1)
+
+Several Odoo servers behind a load balancer, sharing one database, are not modelled in v1.
+Each node keeps its own spool directory and counter stream, and the push cron runs on whichever
+node picks it. On the server side:
+
+- the pushes alternate between two (or more) identities and two `stream_id`s;
+- the counters are additive across streams: sum the streams, never treat one as a reset of
+  the other (dedup stays per `(stream_id, seq)`);
+- the system gauges (`system`, `process`) alternate between machines;
+- a `web.base.url` change lands as a pending copy (rule 1 never sees a stable place), to be
+  resolved by the administrator like any proposal.
 
 ## 6. Security
 

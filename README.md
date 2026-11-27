@@ -123,8 +123,12 @@ startup: it is harmless, Odoo keeps the value.
 
 ## Limitations
 
-- Several Odoo servers sharing one database on different machines: each machine only sees its own
-  workers' counters (the spool directory is local), and the cron runs on one of them at a time.
+- Several Odoo servers behind a load balancer, sharing one database: each node keeps its own
+  counters and stream (the spool directory is local), and the push runs on whichever node picks
+  the scheduled action. Fivenines then sees pushes alternating between the nodes: request and
+  error counters add up across them, system figures alternate between machines, and a change of
+  `web.base.url` shows up as a database waiting for approval (contract section 5, "Limitation:
+  multi-node Odoo").
 - With `log_level = debug_sql` Odoo itself logs every SQL statement with its values, including
   the row that stores the secret. Do not run production at that level.
 - Error messages and tracebacks are sent as logged (bounded: 2000 and 8000 characters) unless

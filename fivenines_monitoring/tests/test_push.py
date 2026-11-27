@@ -531,13 +531,51 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
         self.assertEqual(r.status, 200)
 
+    def test_same_fingerprint_copy_pushing_last_cannot_take_production(self):
+        # Value: protects=a PostgreSQL-level copy with production's fingerprint, accepted alongside production, cannot move production's instance when its admin logs in: rule 1 adopts a URL change only from the same identity and stream over the last 3 accepted pushes; fails_when=rule 1 trusts the last accepted push alone and production then lands as the pending copy; why_new=lead decision on the rule-1 TODO; seam=pushes built from the module's payload with another identity and stream; no_claim=the real server
+        self.run_push()
+        secret = fm.icp_get(self.icp, fm.P_SECRET)
+        record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
+        production = json.loads(json.dumps(self.last_payload()))
+        client = fn_client.Client(self.stub.url, 'test')
+
+        def push(payload, seq):
+            payload = json.loads(json.dumps(payload))
+            payload['seq'] = seq
+            return client.push(secret, payload).status
+
+        copy = json.loads(json.dumps(production))
+        copy['instance']['hostname'] = 'restored-copy'
+        copy['process']['pid'] += 1000
+        copy['stream_id'] = 'f' * 32
+        for seq in (2, 3):
+            self.assertEqual(push(production, seq), 200)
+        self.assertEqual(push(copy, 1), 200, 'same fingerprint: accepted alongside production')
+        # the copy's admin logs in: Odoo rewrites web.base.url, the copy pushes last
+        moved = json.loads(json.dumps(copy))
+        components = dict(moved['instance']['fingerprint_components'], base_url='https://copy.example.com')
+        moved['instance']['fingerprint_components'] = components
+        moved['instance']['fingerprint'] = hashlib.sha256(
+            json.dumps(components, sort_keys=True).encode()).hexdigest()
+        self.assertEqual(push(moved, 2), 409, 'one push from that place is not a stable place')
+        self.assertEqual(record['fingerprint'], production['instance']['fingerprint'])
+        self.assertEqual(push(production, 4), 200, 'production keeps its instance')
+        # the same server, stable over 3 pushes, may still change its URL (rule 1)
+        for seq in (5, 6):
+            self.assertEqual(push(production, seq), 200)
+        stable = json.loads(json.dumps(production))
+        stable['instance']['fingerprint_components'] = dict(components, database=production['instance']['database'])
+        stable['instance']['fingerprint'] = 'e' * 64
+        self.assertEqual(push(stable, 7), 200)
+        self.assertEqual(record['fingerprint'], 'e' * 64)
+
     def test_restore_elsewhere_while_original_is_down_is_only_proposed(self):
         # Value: protects=a production database restored on a test server while production is silent does not take over production's identity: it is proposed (pending) and the original keeps its fingerprint and token; a move is never guessed; fails_when=the server adopts a new place after 15 minutes of silence; why_new=lead review of revision 2 (founder rule); seam=the other place's identity is set on the stub record; no_claim=the real fivenines-server UI ("Replaces an existing database")
         self.run_push()
         first = fm.icp_get(self.icp, fm.P_INSTANCE)
         original = self.stub.state.instances[first]
         fingerprint = original['fingerprint']
-        original['last_identity'] = ('production-host', 1, 1.0)  # the last push came from elsewhere
+        original['recent_places'] = [[['production-host', 1, 1.0], 'prod-stream']]  # the last push came from elsewhere
         original['last_push_at'] -= 1200  # and production has been silent for 20 minutes
         fm.icp_set(self.icp, 'web.base.url', 'https://test-server.example.com')  # admin login on the test server
         out = self.run_push()
