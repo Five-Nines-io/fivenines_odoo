@@ -742,26 +742,30 @@ class FiveninesMonitor(models.AbstractModel):
                     'api_url': api_client.base_url}
         if result.kind == fn_client.IGNORED:
             return self._fn_ignored(state, result, now, components)
+        if kind == 'instance_secret' and result.kind in (
+                fn_client.UNAUTHORIZED, fn_client.FORBIDDEN, fn_client.CONFLICT):
+            # The copied secret cannot announce this copy: its own database is
+            # revoked (401) or disabled (403), or this copy was already
+            # accepted (409: it never gets that secret back, contract s3). A
+            # copy then needs a key: a new proposal. The key goes to the URL
+            # of its own level (_fn_api_url), never to the stored endpoint the
+            # secret came from.
+            key, key_source = self._fn_enrollment_key(params)
+            if key:
+                try:
+                    key_url = self._fn_api_url(params, key_source)
+                except ValueError as e:
+                    return {'result': 'config_error', 'message': str(e)}
+                return self._fn_enroll(fn_client.Client(key_url, api_client.user_agent),
+                                       directory, state, params, components,
+                                       digest, reason, previous_instance, force,
+                                       changed=changed)
+            self._fn_store({P_STATUS: json.dumps({
+                'state': 'copy_needs_key', 'at': int(now), 'copy_key': copy_key(components),
+                'message': result.message})})
+            self._fn_sweep(directory, state)
+            return {'result': 'no_key', 'status': result.status}
         if result.kind == fn_client.UNAUTHORIZED:
-            if kind == 'instance_secret':
-                # the original's secret was revoked: a copy then needs a key.
-                # The key goes to the URL of its own level (_fn_api_url), never
-                # to the stored endpoint the secret came from.
-                key, key_source = self._fn_enrollment_key(params)
-                if key:
-                    try:
-                        key_url = self._fn_api_url(params, key_source)
-                    except ValueError as e:
-                        return {'result': 'config_error', 'message': str(e)}
-                    return self._fn_enroll(fn_client.Client(key_url, api_client.user_agent),
-                                           directory, state, params, components,
-                                           digest, reason, previous_instance, force,
-                                           changed=changed)
-                self._fn_store({P_STATUS: json.dumps({
-                    'state': 'copy_needs_key', 'at': int(now), 'copy_key': copy_key(components),
-                    'message': result.message})})
-                self._fn_sweep(directory, state)
-                return {'result': 'no_key', 'status': result.status}
             self._fn_store({P_STATUS: json.dumps({
                 'state': 'enrollment_refused', 'key_hash': _key_hash(value), 'at': int(now),
                 'copy_key': copy_key(components),

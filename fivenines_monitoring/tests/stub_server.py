@@ -18,6 +18,7 @@ Test-only endpoints (loopback clients only, never part of the contract):
     POST /_stub/revoke_key {"key": "..."}           revoke an enrollment key
     POST /_stub/fail     {"status": 503, "count": 2, "path": "collect"}
     POST /_stub/accept   {"instance_id": "..."}     Monitor a pending database
+    POST /_stub/disable  {"instance_id": "...", "disabled": true}  disable one (403)
     POST /_stub/ignore   {"instance_id": "..."}     Ignore it (final)
     POST /_stub/policy   {"new": "monitored"|"pending", "retry_after": 900}
                          how a first enrollment with a key lands (copies are
@@ -154,6 +155,21 @@ def _copy_components(components):
     return tuple(components.get(k) or None for k in COPY_COMPONENTS)
 
 
+def _valid_unicode(value):
+    """False when any string (keys too) holds a lone surrogate."""
+    if isinstance(value, str):
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError:
+            return False
+        return True
+    if isinstance(value, dict):
+        return all(_valid_unicode(k) and _valid_unicode(v) for k, v in value.items())
+    if isinstance(value, list):
+        return all(_valid_unicode(v) for v in value)
+    return True
+
+
 def _bearer(headers):
     value = headers.get('Authorization') or ''
     parts = value.split()
@@ -194,9 +210,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) > MAX_BODY:
                 return None, 413
         try:
-            return json.loads(raw or b'{}'), None
+            body = json.loads(raw or b'{}')
         except ValueError:
             return None, 400
+        if not _valid_unicode(body):
+            # like the server (contract s2): an escaped lone surrogate is a
+            # malformed body, never repaired
+            return None, 400
+        return body, None
 
     def _injected(self, path):
         st = self.state
@@ -253,6 +274,11 @@ class Handler(BaseHTTPRequestHandler):
                                     'path': body.get('path'),
                                     'retry_after': body.get('retry_after'),
                                     'delay': float(body.get('delay', 0))})
+            elif self.path == '/_stub/disable':
+                inst = st.instances.get(str(body.get('instance_id')))
+                if not inst:
+                    return self._send(404, {'status': 'error', 'message': 'no such instance'})
+                inst['disabled'] = bool(body.get('disabled', True))
             elif self.path in ('/_stub/accept', '/_stub/ignore'):
                 inst = st.instances.get(str(body.get('instance_id')))
                 if not inst:
@@ -311,6 +337,7 @@ class Handler(BaseHTTPRequestHandler):
             'copy_of': previous['instance_id'] if previous else None,
             'enrolled_at': time.time(),
             'revoked': False,
+            'disabled': False,
             'last_push_at': None,
             'last_identity': None,
             'recent_places': [],  # (identity, stream_id) of the last accepted pushes
@@ -361,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
                 known = st.instances.get(st.tokens.get(credential))
                 if not known or known['revoked']:
                     status = 401
+                elif known.get('disabled'):
+                    status = 403  # the secret's own database is disabled (contract s3)
                 elif known['fingerprint'] == fingerprint and body.get('reason') != 'conflict':
                     status = 'same'   # the secret's own database, unchanged
                     # (after a 409 the server already decided: always a copy)
@@ -382,7 +411,10 @@ class Handler(BaseHTTPRequestHandler):
                             break
                     else:
                         inst, created = self._new_instance(body, 'pending', previous=known), True
-                    status = None
+                    # an ACCEPTED copy announcing itself again with the copied
+                    # secret: 409, whatever its silence. It never gets its own
+                    # secret back and never takes over (contract s3).
+                    status = 'accepted_copy' if not created and inst['state'] == 'monitored' else None
             else:
                 entry = st.enrollment_keys.get(credential)
                 if not entry or entry['revoked']:
@@ -396,6 +428,13 @@ class Handler(BaseHTTPRequestHandler):
                     inst, created, status = self._new_instance(body, 'pending', previous=previous), True, None
                 else:
                     inst, created, status = self._new_instance(body, st.new_policy), True, None
+        if status == 403:
+            self._record('enroll', 403)
+            return self._send(403, {'status': 'error', 'message': 'This database is disabled'})
+        if status == 'accepted_copy':
+            self._record('enroll', 409, inst['instance_id'])
+            return self._send(409, {'status': 'error',
+                                    'message': 'This copy is already monitored in Fivenines'})
         if status == 401:
             self._record('enroll', 401)
             return self._send(401, {'status': 'error', 'message': 'Invalid credential'})
@@ -415,6 +454,9 @@ class Handler(BaseHTTPRequestHandler):
         if not inst or inst['revoked']:
             self._record('collect', 401, instance_id)
             return self._send(401, {'status': 'error', 'message': 'Invalid instance token'})
+        if inst.get('disabled'):
+            self._record('collect', 403, instance_id)
+            return self._send(403, {'status': 'error', 'message': 'This database is disabled'})
         if err:
             self._record('collect', err, instance_id)
             return self._send(err, {'status': 'error', 'message': 'invalid body'})
@@ -443,6 +485,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(202, {'status': 'pending', 'state': 'pending', 'name': inst['name'],
                                     'retry_after': st.retry_after})
         now = time.time()
+        if heartbeat and (_copy_components(body['instance'].get('fingerprint_components'))
+                          != _copy_components(inst.get('fingerprint_components'))):
+            # contract s4: a heartbeat from other copy components (a copy
+            # carrying this secret) is answered 200 but not recorded
+            self._record('collect', 200, instance_id)
+            return self._send(200, {'status': 'ok', 'state': 'paused'})
         if heartbeat:
             # contract s4: paused, no metrics. No 409 rule, no fingerprint
             # adoption, no counters: only "paused, last heard at".
@@ -467,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
                 recent = inst['recent_places'][-STABLE_PUSHES:]
                 if all(p == place for p in recent):
                     inst['fingerprint'] = fingerprint
+                    inst['fingerprint_components'] = body['instance'].get('fingerprint_components')
                 else:
                     status = 409
             if status is None:

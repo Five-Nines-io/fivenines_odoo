@@ -337,6 +337,24 @@ class TestCollector(BaseCase):
         for text in ('a' * 8000, 'password=' * 1000, ':' * 8000, 'x://' + 'a' * 7990):
             m(text)  # bounded: each runs in well under a second (quadratic patterns would not)
 
+    def test_records_with_lone_surrogates_reach_the_wire_valid(self):
+        # Value: protects=an error record carrying a lone high or a lone low surrogate (message, args, traceback) is sent as valid Unicode; fails_when=one such logged line gets every push refused until a newer occurrence; why_new=#11; seam=none; no_claim=none
+        import gzip
+        high = logging.LogRecord('odoo.x', logging.ERROR, __file__, 1, 'bad \ud83d name %s', ('x',), None)
+        low = logging.LogRecord('odoo.y', logging.ERROR, __file__, 2, 'cannot open %s',
+                                (b'/srv/\xff.csv'.decode('utf-8', 'surrogateescape'),), None)
+        low.exc_text = 'Traceback (most recent call last):\nOSError: ' + b'\xfe'.decode('utf-8', 'surrogateescape')
+        _Thread.run('db_a', lambda: (self.handler.emit(high), self.handler.emit(low)))
+        logs = stats.logs_payload(self.collector.snapshot('db_a'))
+        body = json.loads(gzip.decompress(fn_client.encode_body({'logs': logs})))
+        texts = [t for g in body['logs']['fingerprints']
+                 for t in (g['message_template'], g['last_message'], g['last_traceback']) if t]
+        for text in texts:
+            text.encode('utf-8')  # raises on a lone surrogate
+        self.assertIn('bad \ufffd name x', texts)
+        self.assertIn('cannot open /srv/\ufffd.csv', texts)
+        self.assertTrue(any(t.endswith('OSError: \ufffd') for t in texts))
+
     def test_cut_never_separates_a_secret_from_its_name(self):
         # Value: protects=a traceback cut at 8000 chars from the end never leaves a credential's value bare because the cut dropped its name; fails_when=masking runs after the cut again; why_new=review of revision 2 (security, adversarial: verified leak); seam=none; no_claim=every credential shape
         for shift in range(0, 40, 3):
@@ -664,6 +682,32 @@ class TestClient(BaseCase):
             self.assertEqual(validate(body, schema), [], name)
         push, heartbeat = load_schema('push_payload.schema.json'), load_schema('heartbeat.schema.json')
         self.assertEqual(heartbeat['properties']['instance'], push['properties']['instance'])
+
+    def test_no_lone_surrogates_on_the_wire(self):
+        # Value: protects=every string the module sends is valid Unicode: lone surrogates (surrogateescape-decoded bytes in a log message or a path) become U+FFFD, a valid pair is kept, keys included; fails_when=json.dumps emits \\udc80 escapes that strict parsers (the server) refuse with a 400 on every push; why_new=#11; seam=none; no_claim=other serializers
+        import gzip
+        low = b'caf\xe9'.decode('utf-8', 'surrogateescape')  # 'caf\udce9'
+        payload = {'message': 'a\ud800b', 'path': low, 'pair': '\ud83d\ude00 \U0001F600', low: [low, 1, None]}
+        raw = gzip.decompress(fn_client.encode_body(payload))
+        body = json.loads(raw)
+
+        def strict(value):  # what a strict parser (Ruby's json gem) requires
+            if isinstance(value, str):
+                value.encode('utf-8')
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    strict(k), strict(v)
+            elif isinstance(value, list):
+                for v in value:
+                    strict(v)
+        strict(body)
+        self.assertNotIn(b'\\udce9', raw)
+        self.assertNotIn(b'\\ud800', raw)
+        self.assertEqual(body['message'], 'a\ufffdb')
+        self.assertEqual(body['path'], 'caf\ufffd')
+        self.assertEqual(body['pair'], '\U0001F600 \U0001F600')
+        self.assertEqual(body['caf\ufffd'], ['caf\ufffd', 1, None])
+        self.assertEqual(fn_client.wire_text('plain text'), 'plain text')
 
     def test_retry_after_header(self):
         # Value: protects=Retry-After parsed, clamped to [0, MAX_RETRY_AFTER], junk ignored; fails_when=clamp/parse removed so server can stall pushes or crash; why_new=_retry_after untested; seam=none; no_claim=HTTP-date form
