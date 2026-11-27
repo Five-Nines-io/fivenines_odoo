@@ -260,7 +260,10 @@ traceback frame (`exception_origin`, `path:line function`) or else the log call 
 A message formatted before logging (an f-string, `'x %s' % v`, `str(e)`, Werkzeug 1.x lines) has
 no template: its values are masked before grouping and sending (emails, URLs, query values,
 `Key (col)=(value)`, quoted strings, long hex ids and numbers become `<email>`, `<url>`, `?`,
-`=(?)`, `'?'`, `<hex>`, `N`), so its variants also share one fingerprint.
+`=(?)`, `'?'`, `<hex>`, `N`), so its variants also share one fingerprint. A pre-formatted
+message longer than 2000 characters is cut: only its text before the first quote or `=(` is kept
+(without either, up to the last whitespace before the cut), masked the same way, and ends with
+` [cut]`.
 
 ### `crons`
 
