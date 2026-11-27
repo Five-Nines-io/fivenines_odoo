@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_DIR = os.path.join(HERE, 'schemas')
-CONFLICT_WINDOW = 900  # seconds: two live places within 15 min = conflict
+MOVE_SILENCE = 900  # seconds: a proposal whose original is silent this long is a probable move
 MAX_BODY = 2 * 1024 * 1024
 
 
@@ -128,11 +128,21 @@ class StubState:
         self.push_schema = load_schema('push_payload.schema.json')
         self.schema_errors = []
 
+    def probable_move(self, inst, now=None):
+        """A proposal (pending copy) whose original has been silent for
+        MOVE_SILENCE: the UI offers "probably a move: take its place"."""
+        original = self.instances.get(inst.get('copy_of') or '')
+        if inst.get('state') != 'pending' or not original:
+            return False
+        last = original.get('last_push_at')
+        return last is None or (now or time.time()) - last >= MOVE_SILENCE
+
     def public(self):
         with self.lock:
             return {
                 'instances': [
-                    {k: v for k, v in inst.items() if k != 'token'}
+                    dict({k: v for k, v in inst.items() if k != 'token'},
+                         probable_move=self.probable_move(inst))
                     for inst in self.instances.values()
                 ],
                 'push_count': len(self.pushes),
@@ -298,7 +308,6 @@ class Handler(BaseHTTPRequestHandler):
             'enrolled_at': time.time(),
             'revoked': False,
             'last_push_at': None,
-            'last_fingerprint_push_at': None,
             'last_identity': None,
             'push_count': 0,
             'pending_checks': 0,
@@ -412,18 +421,16 @@ class Handler(BaseHTTPRequestHandler):
         with st.lock:
             status = None
             if fingerprint != inst['fingerprint']:
-                # contract s5: the same running server changed its URL -> adopt;
-                # another place while the old one pushed < 15 min ago -> 409;
-                # the old place silent for 15 min -> a move, adopt
-                same_process = identity == inst.get('last_identity')
-                live = inst['last_fingerprint_push_at'] and now - inst['last_fingerprint_push_at'] < CONFLICT_WINDOW
-                if live and not same_process:
-                    status = 409
-                else:
+                # contract s5: the same running server changed its URL (or no
+                # push was accepted yet) -> adopt; any other identity -> 409,
+                # whatever the silence: a copy is proposed, never added
+                last = inst.get('last_identity')
+                if last is None or identity == last:
                     inst['fingerprint'] = fingerprint
+                else:
+                    status = 409
             if status is None:
                 inst['last_identity'] = identity
-                inst['last_fingerprint_push_at'] = now
                 inst['last_push_at'] = now
                 inst['push_count'] += 1
                 inst['last_payload'] = body

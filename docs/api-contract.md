@@ -417,7 +417,8 @@ The module compares the current fingerprint with the one stored at enrollment, b
   was copied (staging from production, a restore under another name, Odoo's duplicate which
   regenerates the uuid, a neutralized copy). Before any push, the module announces itself to
   `/enroll` with the secret it carries (`credential: "instance_secret"`,
-  `reason: "fingerprint_changed"`, `changed`, `previous_instance_id`), before any backoff. The
+  `reason: "fingerprint_changed"`, `changed`, `previous_instance_id`), without waiting for the
+  original's backoff (its own failed announcements back off, section 7). The
   server mints a new secret for a new, proposed (pending) database; the copy stores it and the
   copied secret is gone. Until that succeeds the copy pushes nothing with the copied secret.
   Production keeps its own secret, so the two never report as one.
@@ -435,11 +436,23 @@ instance, the fingerprint and the identity of the last accepted push: `instance.
 `process.pid` and `process.started_at`. When a push carries a fingerprint different from the
 stored one:
 
-1. same identity as the last accepted push (the same running server changed its URL): adopt it;
-2. otherwise, if the stored fingerprint pushed within the last 15 minutes (one token, two live
-   places): **answer 409**; the module that gets it announces itself with the token
-   (`reason: "conflict"`), and the server always creates a new pending instance for it;
-3. otherwise (the old place has been silent for 15 minutes: a move): adopt it.
+1. same identity as the last accepted push (the same running server changed its URL): adopt it.
+   Also adopt it when the instance has no accepted push yet (nobody else used the token);
+2. otherwise, **answer 409, whatever the time since the last accepted push**. The module that
+   gets it announces itself with the token (`reason: "conflict"`), and the server always
+   creates a new pending instance for it: a copy is proposed, never added. The server never
+   adopts a new place on its own, even after a silence: a production database restored on a
+   test server while production is down must not take over production's identity.
+
+The server marks a proposal as a **probable move** when its original has been silent (no
+accepted push) for 15 minutes or more, at the announcement or later while the proposal waits.
+The UI then offers "probably a move: take its place": an explicit click makes the proposal the
+instance and revokes the original's token. Without that click both stay apart.
+
+Consequence: a URL change seen with another identity (the first push after a restart that also
+changed `web.base.url`, or from a second node) becomes a proposal too, marked as a probable
+move once the original stays silent. The module cannot tell those cases from a copy;
+the click resolves them.
 
 `fingerprint_change` is informational (show "URL changed"); it never bypasses this rule. A copy
 whose fingerprint and identity both equal the original's cannot be told apart by anyone: it is
@@ -485,7 +498,9 @@ After a retryable failure (`404`, `5xx`, `400`/`413`/`422`, timeout, connection 
 
 `429` uses `Retry-After`; `402`/`403` wait 1 hour; `401` waits 24 hours; `202` (pending) waits
 `retry_after` (default 15 min, 5 min to 6 h); `410` (ignored) stops; `409` announces the copy at
-once. A copy announcement is never delayed by a backoff. A success resets the count. During the backoff the counters keep accumulating: nothing is lost
+once. A copy announces itself without waiting for the original's backoff; a failed announcement
+(`404`, `5xx`, timeout...) then follows this same bounded backoff, so copies do not call
+`/enroll` every minute while Fivenines is down. A success resets the count. During the backoff the counters keep accumulating: nothing is lost
 unless the Odoo processes die AND their spool files are wiped before the next successful push.
 
 ## 8. Module-side storage (for reference)
@@ -515,9 +530,11 @@ acknowledged; a live worker keeps its file however long it has been idle.
 3. Enrollment: section 3 (key or a copy's secret; 201 / 202 / 410 / 401 / 402 / 403,
    `hosts_registered_count`, `last_used_at`, uptime monitors matched on `urls`).
 4. Collect: authenticate by token (401), ignored (410), pending (202, store nothing),
-   subscription (402), 409 rule (section 5), validate against the schema (422 with a short
+   subscription (402), 409 rule (section 5: never adopt another identity on silence alone),
+   validate against the schema (422 with a short
    `message`), dedup by `(stream_id, seq)` (section 4), store, 200.
-5. UI: list instances under the organization, Monitor / Ignore a pending one, revoke one, show
+5. UI: list instances under the organization, Monitor / Ignore a pending one, "probably a
+   move: take its place" on a proposal whose original is silent (section 5), revoke one, show
    "copied from" via `previous_instance_id`, show `server_restart` as an event, not as a gap,
    show `last_message` / `last_traceback` per error group.
 6. Contract tests: post the stub's fixtures (`tests/schemas`) and the payloads the module's
@@ -547,4 +564,6 @@ endpoints on loopback: `GET /_stub/state`, `POST /_stub/revoke {"instance_id"}`,
   component; `neutralize.sql` and the `neutralized_copy` reason are gone, neutralization is
   respected and "Turn it on" is one click); pending (`202`) and ignored (`410`) on both
   endpoints; `instance.urls`; error messages and tracebacks by default with `logs.messages`,
-  credentials always masked; a 409 is answered with a copy announcement.
+  credentials always masked; a 409 is answered with a copy announcement; the 409 rule never
+  adopts another place on silence (rule 3 removed): it proposes it, marked as a probable move;
+  failed copy announcements back off.

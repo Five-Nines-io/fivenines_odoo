@@ -6,9 +6,9 @@
 
 **What:** Recognise "the same place" by more than (hostname, master pid, started_at) when a fingerprint changes.
 
-**Why:** A URL change in the first push after a restart, or a URL change seen from a second node (web + dedicated cron node), gets a 409 and splits one database into two instances.
+**Why:** Since the 409 rule never adopts another identity (revision 2, "a copy is proposed, never added"), a URL change in the first push after a restart, or seen from a second node (web + dedicated cron node), gets a 409 and becomes a proposal: one click ("probably a move: take its place") and a gap in the data.
 
-**Context:** docs/api-contract.md section 5, rule 1. Options: also accept a push whose `events[].server_restart.previous` equals the last accepted identity; adopt a `base_url`-only change (`fingerprint_change = base_url_changed`, same database name and uuid) whatever the identity. The stub (`tests/stub_server.py`, collect) implements the current rule.
+**Context:** docs/api-contract.md section 5, rule 1. Proof of continuity must not travel with a database copy: `events[].server_restart.previous` and `base_url_changed` do (they come from the database), so they cannot adopt. A candidate: the push's `stream_id` equals the last accepted one (it lives in the host-local `state.json`, not in the database, so it survives a process restart but not a restore elsewhere; not a VM snapshot either). The stub (`tests/stub_server.py`, collect) implements the current rule.
 
 **Effort:** S
 **Priority:** P2
@@ -47,18 +47,6 @@
 **Why:** On several nodes, or a staging host refreshed nightly under the same name, a stale or missing state changes the enrollment reason. (Copies no longer depend on it: they are detected from the fingerprint stored in the database, #7.)
 
 **Context:** store `pending_enroll` in `ir.config_parameter` (written rarely), or drop it when the database has neither secret nor fingerprint.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
-
-### A failing copy announcement retries every minute
-
-**What:** A copy announces itself before any backoff (so it never waits for the original's schedule), but that also skips the backoff of its own failed announcements.
-
-**Why:** While Fivenines answers 5xx or times out, each copy sends one `/enroll` per minute instead of backing off to 15 min.
-
-**Context:** `_fn_run_locked`: keep the copy's backoff keyed by its fingerprint digest in `state.json` and honor it when `copy_of` is set.
 
 **Effort:** S
 **Priority:** P3
@@ -159,6 +147,8 @@
 **Depends on:** an Odoo.sh project with admin rights
 
 ## Completed
+
+- A failing copy announcement retried every minute: its own failures now follow the bounded backoff (`state.json` `backoff_fingerprint`), test `test_failed_copy_announcement_backs_off`. (PR #2, lead review)
 
 - Server-wide key moved the push URL of existing enrollments: a secret is now sent to the API URL that issued it (`fivenines.endpoint`). (fivenines_odoo #7)
 - Neutralized copies: `neutralize.sql` is gone; a neutralized copy keeps its secret, stays off until "Turn it on" and announces itself with the copied secret. (fivenines_odoo #7)

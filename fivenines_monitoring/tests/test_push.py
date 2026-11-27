@@ -511,17 +511,45 @@ class TestFingerprint(FiveninesCase, TransactionCase):
         self.assertEqual(len(self.stub_requests('enroll')), 1)
 
     def test_stub_409_rule(self):
-        # Value: protects=the reference server answers 409 to a changed fingerprint from another running server while the old place is live, and adopts it from the same server; fails_when=the contract's s5 rule is not implemented as documented; why_new=decision D3 moved copy detection of URL changes to the server; seam=none; no_claim=the real fivenines-server
+        # Value: protects=the reference server answers 409 to a changed fingerprint from another running server, even after the old place has been silent for over 15 minutes, and adopts it from the same server; fails_when=the contract's s5 rule is not implemented as documented, or a silence lets another place take over; why_new=decision D3, then the founder's rule "a copy is proposed, never added"; seam=none; no_claim=the real fivenines-server
         self.run_push()
         secret = fm.icp_get(self.icp, fm.P_SECRET)
+        record = self.stub.state.instances[fm.icp_get(self.icp, fm.P_INSTANCE)]
         payload = json.loads(json.dumps(self.last_payload()))
         payload['instance']['fingerprint'] = 'f' * 64
         payload['process']['pid'] = payload['process']['pid'] + 1  # another server
         r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
         self.assertEqual(r.status, 409)
+        record['last_push_at'] -= 3600  # the old place has been silent for an hour
+        r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
+        self.assertEqual(r.status, 409, 'never adopted on silence alone')
         payload['process']['pid'] = self.last_payload()['process']['pid']  # same server
         r = fn_client.Client(self.stub.url, 'test').push(secret, payload)
         self.assertEqual(r.status, 200)
+
+    def test_restore_elsewhere_while_original_is_down_is_only_proposed(self):
+        # Value: protects=a production database restored on a test server while production is silent does not take over production's identity: it is proposed (pending), marked as a probable move, and the original keeps its fingerprint and token; fails_when=the server adopts a new place after 15 minutes of silence; why_new=lead review of revision 2 (founder rule); seam=the other place's identity is set on the stub record; no_claim=the real fivenines-server UI
+        self.run_push()
+        first = fm.icp_get(self.icp, fm.P_INSTANCE)
+        original = self.stub.state.instances[first]
+        fingerprint = original['fingerprint']
+        original['last_identity'] = ('production-host', 1, 1.0)  # the last push came from elsewhere
+        original['last_push_at'] -= 1200  # and production has been silent for 20 minutes
+        fm.icp_set(self.icp, 'web.base.url', 'https://test-server.example.com')  # admin login on the test server
+        out = self.run_push()
+        self.assertEqual((out['result'], out['state']), ('conflict', 'pending'), out)
+        proposal = fm.icp_get(self.icp, fm.P_INSTANCE)
+        self.assertNotEqual(proposal, first)
+        state = {i['instance_id']: i for i in self.stub.state.public()['instances']}
+        self.assertEqual((state[proposal]['copy_of'], state[proposal]['reason']), (first, 'conflict'))
+        self.assertTrue(state[proposal]['probable_move'])
+        self.assertFalse(state[first]['probable_move'])
+        self.assertEqual((original['state'], original['fingerprint']), ('monitored', fingerprint),
+                         'production keeps its identity')
+        self.assertFalse(original['revoked'])
+        original['last_push_at'] = time.time()  # production is back: no longer a probable move
+        state = {i['instance_id']: i for i in self.stub.state.public()['instances']}
+        self.assertFalse(state[proposal]['probable_move'])
 
     def test_url_change_from_localhost_is_adopted(self):
         fm.icp_set(self.icp, 'web.base.url', 'http://localhost:8069')
